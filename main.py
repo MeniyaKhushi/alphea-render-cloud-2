@@ -568,6 +568,13 @@ app = Flask(__name__)
 def ensure_cluster_running():
     start_cluster()
 
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Connect-Protocol-Version'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return response
+
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -874,28 +881,48 @@ def api_status():
         'total_balance': sum(d.get('balance', 0) for d in cluster_state.values())
     }), 200
 
-@app.route('/api/update_account', methods=['POST'])
+@app.route('/api/update_account', methods=['POST', 'OPTIONS'])
 def api_update_account():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
     data = request.json or {}
     email = data.get('email')
     at = data.get('accessToken')
     rt = data.get('refreshToken')
+    dev_id = data.get('deviceId')
     if not email or not at:
         return jsonify({'error': 'email and accessToken required'}), 400
+
+    target_node = None
     for node in cluster_nodes:
         if node.email == email:
-            node.access_token = at
-            if rt:
-                node.refresh_token = rt
-            node.jwt_exp = decode_jwt_exp(at)
-            node.session_id = None
-            node.status = 'Mining Active'
-            node.consecutive_errors = 0
-            node.save_updated_tokens()
-            node.start_foreground_session()
-            add_log(f"[{node.name}] Live session updated & revived successfully via API!")
-            return jsonify({'success': True, 'message': f'Revived {email} live!'}), 200
-    return jsonify({'error': 'Account not found in cluster'}), 404
+            target_node = node
+            break
+
+    if not target_node:
+        for node in cluster_nodes:
+            if '@alphea.local' in node.email or not node.access_token:
+                target_node = node
+                target_node.email = email
+                if dev_id:
+                    target_node.device_id = dev_id
+                break
+
+    if target_node:
+        target_node.access_token = at
+        if rt:
+            target_node.refresh_token = rt
+        target_node.jwt_exp = decode_jwt_exp(at)
+        target_node.session_id = None
+        target_node.status = 'Mining Active'
+        target_node.consecutive_errors = 0
+        target_node.save_updated_tokens()
+        target_node.start_foreground_session()
+        add_log(f"[{target_node.name}] Live session updated & revived for {email} via API!")
+        return jsonify({'success': True, 'name': target_node.name, 'message': f'Revived {email} live!'}), 200
+
+    return jsonify({'error': 'Cluster is full (5/5 accounts already active)'}), 400
 
 @app.route('/api/revive_cluster', methods=['GET', 'POST'])
 def api_revive_cluster():
