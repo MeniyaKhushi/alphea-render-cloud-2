@@ -202,8 +202,7 @@ class AccountWorker(threading.Thread):
                         a['email'] = self.email
                         a['accessToken'] = self.access_token
                         a['refreshToken'] = self.refresh_token
-                        if self.device_id:
-                            a['deviceId'] = self.device_id
+                        a['deviceId'] = self.device_id
                         matched = True
                         break
 
@@ -465,6 +464,12 @@ class AccountWorker(threading.Thread):
         self.update_cluster_state()
         self.verify_proxy_ip()
 
+        if '@alphea.local' in self.email or not self.access_token:
+            self.status = 'Waiting for Sync'
+            self.update_cluster_state()
+            while '@alphea.local' in self.email or not self.access_token:
+                time.sleep(5)
+
         self.status = 'Connecting...'
         self.update_cluster_state()
         self.check_redeem_balance()
@@ -474,6 +479,12 @@ class AccountWorker(threading.Thread):
 
         tick = 0
         while True:
+            if '@alphea.local' in self.email or not self.access_token:
+                self.status = 'Waiting for Sync'
+                self.update_cluster_state()
+                time.sleep(5)
+                continue
+
             try:
                 self.submit_heartbeat()
                 tick += 1
@@ -694,6 +705,25 @@ DASHBOARD_HTML = '''
     }
     .log-entry { margin-bottom: 4px; }
     .footer { text-align: center; color: var(--muted); font-size: 11px; margin-top: 20px; }
+    .btn-remove {
+      background: rgba(255, 51, 102, 0.12);
+      border: 1px solid rgba(255, 51, 102, 0.35);
+      color: var(--red);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      transition: all 0.2s ease;
+    }
+    .btn-remove:hover {
+      background: rgba(255, 51, 102, 0.25);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 12px rgba(255, 51, 102, 0.2);
+    }
   </style>
 </head>
 <body>
@@ -733,6 +763,7 @@ DASHBOARD_HTML = '''
             <th>Daily</th>
             <th>Onboard</th>
             <th>Status</th>
+            <th>Action</th>
           </tr>
         </thead>
         <tbody>
@@ -768,11 +799,18 @@ DASHBOARD_HTML = '''
             <td>
               {% if acc.status == 'Mining Active' %}
                 <span class="badge badge-green">● Mining</span>
+              {% elif 'Waiting for Sync' in acc.status or '@alphea.local' in acc.email %}
+                <span class="badge badge-yellow">⏳ Waiting for Sync</span>
               {% elif '401' in acc.status %}
                 <span class="badge badge-red">{{ acc.status }}</span>
               {% else %}
                 <span class="badge badge-yellow">{{ acc.status }}</span>
               {% endif %}
+            </td>
+            <td>
+              <button onclick="removeAccount({{ acc.index - 1 }}, '{{ acc.name }}')" class="btn-remove">
+                🗑️ Remove
+              </button>
             </td>
           </tr>
           {% endfor %}
@@ -814,6 +852,19 @@ DASHBOARD_HTML = '''
       ALPHEA Connect 24/7 Cloud Matrix &bull; Optimized for Render.com &bull; Uptime: {{ service_uptime }}
     </div>
   </div>
+  <script>
+    function removeAccount(index, name) {
+      if (confirm(`Kya aap ${name} ko Cluster 2 se remove karke khali slot banana chahte hain?`)) {
+        fetch('/api/reset_slot/' + index, { method: 'POST' })
+          .then(r => r.json())
+          .then(d => {
+            alert(d.message);
+            location.reload();
+          })
+          .catch(e => alert('Error: ' + e));
+      }
+    }
+  </script>
 </body>
 </html>
 '''
@@ -908,11 +959,18 @@ def api_update_account():
     if not email or not at:
         return jsonify({'error': 'email and accessToken required'}), 400
 
-    target_node = None
-    for node in cluster_nodes:
-        if node.email == email:
-            target_node = node
-            break
+    target_slot = data.get('slot') if data.get('slot') is not None else data.get('index')
+    if target_slot is not None and 0 <= int(target_slot) < len(cluster_nodes):
+        target_node = cluster_nodes[int(target_slot)]
+        target_node.email = email
+        if dev_id:
+            target_node.device_id = dev_id
+
+    if not target_node:
+        for node in cluster_nodes:
+            if node.email == email:
+                target_node = node
+                break
 
     if not target_node:
         for node in cluster_nodes:
@@ -937,6 +995,59 @@ def api_update_account():
         return jsonify({'success': True, 'name': target_node.name, 'message': f'Revived {email} live!'}), 200
 
     return jsonify({'error': 'Cluster is full (5/5 accounts already active)'}), 400
+
+@app.route('/api/reset_slot/<int:slot_index>', methods=['POST', 'GET'])
+def api_reset_slot(slot_index):
+    start_cluster()
+    if slot_index < 0 or slot_index >= len(cluster_nodes):
+        return jsonify({'error': 'Invalid slot index'}), 400
+
+    node = cluster_nodes[slot_index]
+    old_email = node.email
+    node.email = f"node{slot_index + 1}_c2@alphea.local"
+    node.access_token = ""
+    node.refresh_token = ""
+    node.device_id = ""
+    node.jwt_exp = None
+    node.session_id = None
+    node.session_uptime = 0
+    node.today_seconds = 0
+    node.cached_balance = 0
+    node.status = 'Waiting for Sync'
+    node.consecutive_errors = 0
+    node.save_updated_tokens()
+    node.update_cluster_state()
+    add_log(f"[{node.name}] Removed {old_email} -> Slot reset to Waiting for Sync!")
+    return jsonify({
+        'success': True,
+        'message': f"Slot {slot_index + 1} ({node.name}) removed successfully! Now ready for new account sync."
+    }), 200
+
+@app.route('/api/remove_account', methods=['POST'])
+def api_remove_account():
+    start_cluster()
+    data = request.json or {}
+    email = data.get('email')
+    slot_idx = data.get('slot') if data.get('slot') is not None else data.get('index')
+
+    target_node = None
+    if slot_idx is not None:
+        try:
+            s_idx = int(slot_idx)
+            if 0 <= s_idx < len(cluster_nodes):
+                target_node = cluster_nodes[s_idx]
+        except Exception:
+            pass
+    elif email:
+        for node in cluster_nodes:
+            if node.email == email:
+                target_node = node
+                break
+
+    if not target_node:
+        return jsonify({'error': 'Account not found in cluster'}), 404
+
+    return api_reset_slot(target_node.index)
 
 @app.route('/api/revive_cluster', methods=['GET', 'POST'])
 def api_revive_cluster():
