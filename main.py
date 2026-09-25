@@ -600,6 +600,15 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return response
 
+@app.errorhandler(Exception)
+def handle_exception(e):
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return jsonify({'error': e.description}), e.code
+    add_log(f"[API ERROR] Unhandled exception: {e}")
+    return jsonify({'error': str(e)}), 500
+
+
 DASHBOARD_HTML = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -959,12 +968,18 @@ def api_update_account():
     if not email or not at:
         return jsonify({'error': 'email and accessToken required'}), 400
 
+    target_node = None
     target_slot = data.get('slot') if data.get('slot') is not None else data.get('index')
-    if target_slot is not None and 0 <= int(target_slot) < len(cluster_nodes):
-        target_node = cluster_nodes[int(target_slot)]
-        target_node.email = email
-        if dev_id:
-            target_node.device_id = dev_id
+    if target_slot is not None:
+        try:
+            s_idx = int(target_slot)
+            if 0 <= s_idx < len(cluster_nodes):
+                target_node = cluster_nodes[s_idx]
+                target_node.email = email
+                if dev_id:
+                    target_node.device_id = dev_id
+        except Exception:
+            pass
 
     if not target_node:
         for node in cluster_nodes:
@@ -974,7 +989,7 @@ def api_update_account():
 
     if not target_node:
         for node in cluster_nodes:
-            if '@alphea.local' in node.email or not node.access_token or '401' in node.status or 'Dead' in node.status:
+            if '@alphea.local' in node.email or not node.access_token or '401' in node.status or 'Dead' in node.status or 'Waiting for Sync' in node.status:
                 target_node = node
                 target_node.email = email
                 if dev_id:
