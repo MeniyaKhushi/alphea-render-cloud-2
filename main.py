@@ -1114,10 +1114,10 @@ def route_update_account():
                     target_node = node
                     break
 
-        # 2. Look for an unassigned placeholder slot (@alphea.local)
+        # 2. Look for an unassigned placeholder slot (@alphea.local) ONLY
         if not target_node:
             for node in NODES:
-                if '@alphea.local' in node.email or not node.access_token:
+                if '@alphea.local' in node.email.lower() or not node.email:
                     target_node = node
                     break
 

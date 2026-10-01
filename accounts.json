@@ -1,52 +1,62 @@
 [
   {
     "name": "Node 1 (USA)",
-    "email": "kptech8193@gmail.com",
-    "deviceId": "e1f2a3b4c5d6e7f8",
+    "email": "thekptech2428@gmail.com",
+    "deviceId": "008bc82869767700",
     "proxy": "http://wtbhmkwu-1:wgkurrh625yw@p.webshare.io:80",
     "location": "USA (Los Angeles)",
-    "accessToken": "",
-    "refreshToken": "",
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InRoZWtwdGVjaDI0MjhAZ21haWwuY29tIiwic2lkIjoiNjlhY2ZkOGUtODliMS00YmViLThmYzYtMDgxNjY4MmIzOTMzIiwiYXV0aF90aW1lIjoxNzkwNDI4MzAzLCJpc3MiOiJhbHBoZWEtY29ubmVjdCIsInN1YiI6IjY5NzEwODM5LWQ5MjYtNGY3Yi1hYmJkLWViNDdiN2RhNjU3OSIsImV4cCI6MTc5MDg3MDA4OCwiaWF0IjoxNzkwODY2NDg4fQ.ikD9L2U_ZtRIWX51oSDuqQykY6F01glZ_4RLo1fj_YA",
+    "refreshToken": "3DryJ1nSDJ9nCY9dqS5xM1W0eFdCa5seTnk_fOUS7qo",
     "enabled": true
   },
   {
     "name": "Node 2 (UK)",
-    "email": "meniyakapil123@gmail.com",
-    "deviceId": "f2a3b4c5d6e7f8a1",
+    "email": "kptech8193@gmail.com",
+    "deviceId": "3fbda2731aa13cef",
     "proxy": "http://wtbhmkwu-2:wgkurrh625yw@p.webshare.io:80",
     "location": "UK (London)",
-    "accessToken": "",
-    "refreshToken": "",
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImtwdGVjaDgxOTNAZ21haWwuY29tIiwic2lkIjoiMjUxYzAzMzUtMjY4Ni00YmNiLThkMjEtNjQ4YTcyYWMyNWM3IiwiYXV0aF90aW1lIjoxNzkwODQ0MTA4LCJpc3MiOiJhbHBoZWEtY29ubmVjdCIsInN1YiI6IjVkNGEzOGE4LTQzODctNDNhZC1iN2JhLWUxY2QyMzc3ZjUwOSIsImV4cCI6MTc5MDg3MTg3MSwiaWF0IjoxNzkwODY4MjcxfQ.fHRE8nFCtbIlbDkJ1aIFzok_Rzz4Fcfh_R4vfE5iV6g",
+    "refreshToken": "ijlIPDm8A1FdJjSsl0hAS3tOIO1wQayXGiAi9CUZfwc",
     "enabled": true
   },
   {
     "name": "Node 3 (USA)",
-    "email": "thekptech2428@gmail.com",
-    "deviceId": "a3b4c5d6e7f8a1b2",
+    "email": "meniyakapil123@gmail.com",
+    "deviceId": "6c9f01b9bc51de3b",
     "proxy": "http://wtbhmkwu-4:wgkurrh625yw@p.webshare.io:80",
     "location": "USA (Los Angeles)",
-    "accessToken": "",
-    "refreshToken": "",
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6Im1lbml5YWthcGlsMTIzQGdtYWlsLmNvbSIsInNpZCI6IjNkMjljZGQxLTQ0ZmUtNDdkYS1iYjQxLTM0MTk2MDI5M2MwZSIsImF1dGhfdGltZSI6MTc5MDg2NTQ5OCwiaXNzIjoiYWxwaGVhLWNvbm5lY3QiLCJzdWIiOiI5OTQ1NDZhNS0wNDJjLTQ3NTktYjQ5MS05Zjk2YzZkNWY2NjkiLCJleHAiOjE3OTA4NzIxMTUsImlhdCI6MTc5MDg2ODUxNX0.ZYdT80SHJn0uKh6TIQmUGXPERtwZYKzTy_e8nIELUN0",
+    "refreshToken": "546WrHak7aCALeLxXOF9wbd7J6PgB-EaRNBwCyhv9GQ",
     "enabled": true
   },
   {
     "name": "Node 4 (Poland)",
     "email": "boyrisky083@gmail.com",
-    "deviceId": "b4c5d6e7f8a1b2c3",
+    "deviceId": "bfe19769970236e5",
     "proxy": "http://wtbhmkwu-5:wgkurrh625yw@p.webshare.io:80",
     "location": "Poland (Warsaw)",
-    "accessToken": "",
-    "refreshToken": "",
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImJveXJpc2t5MDgzQGdtYWlsLmNvbSIsInNpZCI6IjI5MmJjODBjLTRiMDYtNDRkZi05YTNiLWFjZTUzNjljYzI5ZSIsImF1dGhfdGltZSI6MTc5MDgzMzg0MSwiaXNzIjoiYWxwaGVhLWNvbm5lY3QiLCJzdWIiOiIwZmJhNWYwMC03MDMwLTQ3ZjgtYWY3ZS1kOTJkM2ExOTEwMmIiLCJleHAiOjE3OTA4NzE5MzEsImlhdCI6MTc5MDg2ODMzMX0.kOJjlP_zOgaOTAtyZulFOMZVqDosu30I6A_1X_-NITs",
+    "refreshToken": "4lOn4XiA6wlZdF7LBtNBRhktmfqwRjBM_aMvlbF6-BQ",
     "enabled": true
   },
   {
     "name": "Node 5 (Germany)",
     "email": "smindset051@gmail.com",
-    "deviceId": "c5d6e7f8a1b2c3d4",
+    "deviceId": "648871743982d85d",
     "proxy": "http://wtbhmkwu-6:wgkurrh625yw@p.webshare.io:80",
     "location": "Germany (Frankfurt)",
-    "accessToken": "",
-    "refreshToken": "",
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InNtaW5kc2V0MDUxQGdtYWlsLmNvbSIsInNpZCI6IjJiOGJjYTAxLTNkZDUtNDJhNC04MGZlLWE0NDMzMzA5YjEyOCIsImF1dGhfdGltZSI6MTc5MDgzMzg4MiwiaXNzIjoiYWxwaGVhLWNvbm5lY3QiLCJzdWIiOiIzNjUyNTMwMC0zNzMxLTQ3NTEtOTQ1Zi0zMjFmMDE4OTcyNmYiLCJleHAiOjE3OTA4NzE4NjEsImlhdCI6MTc5MDg2ODI2MX0.KP3DB6HKuSIChVo8dLJ_9QnSjR_0-1lFobi_iPMUVKA",
+    "refreshToken": "8OylgiobrOFQqaqeEhZVFjC1dIB-HwcZJoHHY096Yq0",
+    "enabled": true
+  },
+  {
+    "name": "Cluster 2 Node 6",
+    "email": "simran.davis@freediamond.in",
+    "deviceId": "0d8159550bd1ba7d",
+    "proxy": null,
+    "location": "Direct Render VPS",
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InNpbXJhbi5kYXZpc0BmcmVlZGlhbW9uZC5pbiIsInNpZCI6IjNkOTNjMWQzLTQ4NGUtNDA4OC04ZDMwLTVmMTQ3NGYzMTkzYSIsImF1dGhfdGltZSI6MTc5MDg2OTQ5NSwiaXNzIjoiYWxwaGVhLWNvbm5lY3QiLCJzdWIiOiJiYTEyYjBiMy05ZWJmLTQ0ZGYtOGZmYy1iOWEzOGNmYWQzOTYiLCJleHAiOjE3OTA4NzMwOTUsImlhdCI6MTc5MDg2OTQ5NX0.opM_cLEmq3NDrsxu6WvEe6FLLgvMh2fk8YtHrdNM3FU",
+    "refreshToken": "zBSDMLoBpwEUXC2LXYBKC3UeBkymk2q9u9VWUpPeRyw",
     "enabled": true
   }
 ]
