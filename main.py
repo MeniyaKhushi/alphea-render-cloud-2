@@ -145,10 +145,16 @@ class AccountWorker:
         self.access_token = account_data.get('accessToken', '')
         self.refresh_token = account_data.get('refreshToken', '')
         self.enabled = account_data.get('enabled', True)
-        self.location = account_data.get('location', 'Direct Render VPS')
+        self.proxy = account_data.get('proxy')
+        self.location = account_data.get('location') or ('Direct Render VPS' if not self.proxy else 'Residential Proxy')
 
         self.user_agent = USER_AGENTS[index % len(USER_AGENTS)]
         self.session = requests.Session()
+        if self.proxy:
+            self.session.proxies = {
+                'http': self.proxy,
+                'https': self.proxy
+            }
 
         self.status = "Initializing"
         self.session_id = None
@@ -215,7 +221,7 @@ class AccountWorker:
                         'name': n.name,
                         'email': n.email,
                         'deviceId': n.device_id,
-                        'proxy': None,
+                        'proxy': getattr(n, 'proxy', None),
                         'location': n.location,
                         'accessToken': n.access_token,
                         'refreshToken': n.refresh_token,
@@ -304,6 +310,17 @@ class AccountWorker:
                         self.status = '401 Session Dead (Re-login needed)'
                         self.update_cluster_state()
                 return r
+            except (requests.exceptions.ProxyError, requests.exceptions.SSLError) as pe:
+                if self.session.proxies:
+                    add_log(f"[{self.name}] Proxy glitch ({pe.__class__.__name__}). Auto-failover to Direct Render VPS IP...")
+                    self.session.proxies = {}
+                    self.location = "Direct Render VPS (Failover)"
+                    continue
+                if attempt == 0:
+                    time.sleep(2)
+                    continue
+                self.consecutive_errors += 1
+                return None
             except Exception as e:
                 if attempt == 0:
                     time.sleep(2)
