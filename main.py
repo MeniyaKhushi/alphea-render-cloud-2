@@ -1035,10 +1035,12 @@ class AccountWorker:
         if self.jwt_exp and time.time() > (self.jwt_exp - 120):
             if not self.refresh_access_token():
                 if '@freediamond.in' in self.email:
-                    self.auto_relogin_via_otp()
+                    if self.auto_relogin_via_otp():
+                        self.start_foreground_session()
+                return
 
-        # 2. Check 401 / Dead / Relogin / Expired state
-        if '401' in self.status or 'Dead' in self.status or 'Auto-Relogin' in self.status or 'Expired' in self.status:
+        # 2. Check 401 / Dead / Relogin / Expired / Error state
+        if '401' in self.status or 'Dead' in self.status or 'Auto-Relogin' in self.status or 'Expired' in self.status or 'Error' in self.status:
             now = time.time()
             if hasattr(self, '_last_relogin_attempt') and (now - self._last_relogin_attempt) < 300:
                 return
