@@ -327,11 +327,12 @@ class AccountWorker:
         now = time.time()
         if hasattr(self, '_last_relogin_attempt') and now - self._last_relogin_attempt < 300:
             return False
-        self._last_relogin_attempt = now
 
         # Non-blocking lock: Only 1 account runs OTP relogin at a time so workers NEVER freeze or timeout!
         if not OTP_LOCK.acquire(blocking=False):
             return False
+
+        self._last_relogin_attempt = now
 
         try:
             add_log(f"[{self.name}] 🔄 NEVER-DIE: Initiating OTP auto-relogin for {self.email} (Acquired OTP_LOCK)...")
@@ -499,11 +500,14 @@ class AccountWorker:
                 return True
             else:
                 if not self.jwt_exp or time.time() >= self.jwt_exp:
-                    add_log(f"[{self.name}] Refresh failed ({r.status_code}). Trying OTP auto-relogin...")
                     if '@freediamond.in' in self.email:
+                        add_log(f"[{self.name}] Refresh failed ({r.status_code}). Initiating OTP auto-relogin...")
                         return self.auto_relogin_via_otp()
-                    self.status = f"401 Invalid Refresh Token ({r.status_code})"
-                    self.update_cluster_state()
+                    else:
+                        add_log(f"[{self.name}] Refresh failed ({r.status_code}). Manual account awaiting Extension sync.")
+                        self.status = "401 Expired (Re-sync via Extension)"
+                        self.update_cluster_state()
+                        return False
                 add_log(f"[{self.name}] Refresh failed: {r.status_code} {r.text[:80]}")
                 return False
         except Exception as e:
@@ -539,6 +543,17 @@ class AccountWorker:
                         self.status = '401 Session Dead (Re-login needed)'
                         self.update_cluster_state()
                 return r
+            except (requests.exceptions.ProxyError, requests.exceptions.SSLError, requests.exceptions.ConnectTimeout) as pe:
+                if getattr(self, 'proxy', None) and self.session.proxies:
+                    add_log(f"[{self.name}] Proxy glitch ({pe.__class__.__name__}). Retrying via Direct Render VPS...")
+                    self.session.proxies = {}
+                    self.location = "Direct Render VPS (Failover)"
+                    continue
+                if attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                self.consecutive_errors += 1
+                return None
             except Exception as e:
                 if attempt == 0:
                     time.sleep(1.5)
@@ -1631,11 +1646,14 @@ def route_revive_cluster():
 
 @app.route('/api/relogin_dead_nodes', methods=['GET', 'POST'])
 def route_relogin_dead_nodes():
-    """Never-Die endpoint: Find all 401 dead @freediamond.in nodes and auto-relogin via OTP"""
-    dead_nodes = [n for n in NODES if ('401' in n.status or 'Dead' in n.status) and '@freediamond.in' in n.email]
+    """Never-Die endpoint: Find all expired or dead @freediamond.in nodes and auto-relogin via OTP"""
+    dead_nodes = [
+        n for n in NODES
+        if '@freediamond.in' in n.email and (n.status != 'Mining Active' or not n.access_token or not n.jwt_exp or time.time() >= n.jwt_exp)
+    ]
     
     def relogin_runner():
-        add_log(f"[NEVER-DIE] Starting OTP relogin for {len(dead_nodes)} dead freediamond.in nodes...")
+        add_log(f"[NEVER-DIE] Starting OTP relogin for {len(dead_nodes)} freediamond.in nodes...")
         success = 0
         failed = 0
         for node in dead_nodes:
@@ -1650,7 +1668,7 @@ def route_relogin_dead_nodes():
                 add_log(f"[NEVER-DIE] Error relogging {node.name}: {e}")
                 failed += 1
             # Stagger requests to avoid rate limiting
-            time.sleep(random.uniform(5.0, 10.0))
+            time.sleep(random.uniform(2.5, 4.0))
         add_log(f"[NEVER-DIE] Batch relogin done! Success: {success} | Failed: {failed}")
     
     threading.Thread(target=relogin_runner, daemon=True).start()
@@ -1874,6 +1892,30 @@ def initialize_cluster():
             else:
                 worker.update_cluster_state()
                 worker.start()
+
+    if not PAUSE_MODE and ENABLE_AUTO_OTP:
+        def boot_relogin_worker():
+            time.sleep(8)
+            add_log("[BOOT RECOVERY] Automated sequential recovery started for freediamond nodes...")
+            with NODES_LOCK:
+                nodes_copy = list(NODES)
+            recovered_count = 0
+            for node in nodes_copy:
+                if PAUSE_MODE:
+                    break
+                if '@freediamond.in' in node.email and (not node.access_token or not node.jwt_exp or time.time() >= node.jwt_exp):
+                    try:
+                        success = node.auto_relogin_via_otp()
+                        if success:
+                            node.start_foreground_session()
+                            recovered_count += 1
+                            time.sleep(2.5)
+                    except Exception as ex:
+                        add_log(f"[{node.name}] Boot recovery note: {ex}")
+                        time.sleep(2.0)
+            add_log(f"[BOOT RECOVERY] Sequence finished. Successfully recovered {recovered_count} nodes to Mining Active!")
+
+        threading.Thread(target=boot_relogin_worker, name="BootReloginWorker", daemon=True).start()
 
 if __name__ == '__main__':
     add_log(f"Starting Cluster 2 Flask server on port {PORT}...")
