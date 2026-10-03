@@ -601,6 +601,9 @@ class AccountWorker:
     def check_redeem_balance(self):
         return self.check_round_redeem_status()
 
+    def sync_user_points(self):
+        return self.check_round_redeem_status()
+
     def check_round_redeem_status(self):
         # Query official wallet point balance to ensure 100% sync with hub.alphea.ai
         try:
