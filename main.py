@@ -20,7 +20,7 @@ GITHUB_FILE_PATH = 'accounts.json'
 ACCOUNTS_FILE = 'accounts.json'
 MASTER_INVITE_CODE = os.environ.get('MASTER_INVITE_CODE', '1F2C0Y5QG_')
 PAUSE_MODE = False  # ACTIVE: 24/7 Zero-Crash High-Efficiency Worker Pool
-ENABLE_AUTO_OTP = os.environ.get('ENABLE_AUTO_OTP', 'false').lower() == 'true'  # Cluster 2: Disabled by default to stop OTP spam loops
+ENABLE_AUTO_OTP = True  # Fully enabled for 24/7 autopilot never-die auto-relogin across all accounts
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -319,9 +319,6 @@ class AccountWorker:
           3. POST VerifyEmailChallenge with code -> get fresh accessToken + refreshToken
           4. Inject new tokens, save to GitHub
         """
-        if not ENABLE_AUTO_OTP:
-            return False
-
         if '@freediamond.in' not in self.email:
             add_log(f"[{self.name}] Auto-relogin skipped (non-freediamond.in account: {self.email})")
             return False
@@ -332,8 +329,11 @@ class AccountWorker:
             return False
         self._last_relogin_attempt = now
 
-        # PERMANENT OTP_LOCK: Stagger OTP requests across the cluster sequentially (eliminates 503 rate limits)
-        with OTP_LOCK:
+        # Non-blocking lock: Only 1 account runs OTP relogin at a time so workers NEVER freeze or timeout!
+        if not OTP_LOCK.acquire(blocking=False):
+            return False
+
+        try:
             add_log(f"[{self.name}] 🔄 NEVER-DIE: Initiating OTP auto-relogin for {self.email} (Acquired OTP_LOCK)...")
             self.status = "Auto-Relogin: Requesting OTP..."
             self.update_cluster_state()
@@ -363,13 +363,13 @@ class AccountWorker:
                     add_log(f"[{self.name}] OTP request failed: {r.status_code} {r.text[:80]}")
                     self.status = f"Auto-Relogin Failed ({r.status_code})"
                     self.update_cluster_state()
-                    time.sleep(3.5)
+                    time.sleep(2.0)
                     return False
 
                 challenge_id = r.json().get('challengeId') or r.json().get('challenge_id', '')
                 if not challenge_id:
                     add_log(f"[{self.name}] No challengeId in response: {r.text[:100]}")
-                    time.sleep(3.5)
+                    time.sleep(2.0)
                     return False
 
                 add_log(f"[{self.name}] OTP requested. Challenge: {challenge_id[:12]}... Polling inbox...")
@@ -398,7 +398,7 @@ class AccountWorker:
                     add_log(f"[{self.name}] OTP not received within 90s. Relogin aborted.")
                     self.status = "Auto-Relogin: OTP Timeout"
                     self.update_cluster_state()
-                    time.sleep(3.5)
+                    time.sleep(2.0)
                     return False
 
                 # Step 3: Verify OTP and get fresh tokens
@@ -412,7 +412,7 @@ class AccountWorker:
                     add_log(f"[{self.name}] OTP verify failed: {vr.status_code} {vr.text[:80]}")
                     self.status = f"Auto-Relogin: Verify Failed ({vr.status_code})"
                     self.update_cluster_state()
-                    time.sleep(3.5)
+                    time.sleep(2.0)
                     return False
 
                 session_data = vr.json().get('session', {})
@@ -421,7 +421,7 @@ class AccountWorker:
 
                 if not new_access or not new_refresh:
                     add_log(f"[{self.name}] No tokens in verify response: {vr.text[:100]}")
-                    time.sleep(3.5)
+                    time.sleep(2.0)
                     return False
 
                 # Step 4: Inject fresh tokens
@@ -441,15 +441,17 @@ class AccountWorker:
 
                 exp_mins = max(0, int((self.jwt_exp - time.time()) // 60)) if self.jwt_exp else 0
                 add_log(f"[{self.name}] ✅ NEVER-DIE SUCCESS: Fresh tokens injected! JWT valid for ~{exp_mins}m")
-                time.sleep(3.5)
+                time.sleep(2.0)
                 return True
 
             except Exception as e:
                 add_log(f"[{self.name}] Auto-relogin exception: {e}")
                 self.status = "Auto-Relogin: Error"
                 self.update_cluster_state()
-                time.sleep(3.5)
+                time.sleep(2.0)
                 return False
+        finally:
+            OTP_LOCK.release()
 
     def refresh_access_token(self):
         if not self.refresh_token:
@@ -497,8 +499,8 @@ class AccountWorker:
                 return True
             else:
                 if not self.jwt_exp or time.time() >= self.jwt_exp:
-                    add_log(f"[{self.name}] Refresh failed ({r.status_code}).")
-                    if ENABLE_AUTO_OTP and '@freediamond.in' in self.email:
+                    add_log(f"[{self.name}] Refresh failed ({r.status_code}). Trying OTP auto-relogin...")
+                    if '@freediamond.in' in self.email:
                         return self.auto_relogin_via_otp()
                     self.status = f"401 Invalid Refresh Token ({r.status_code})"
                     self.update_cluster_state()
@@ -1032,8 +1034,8 @@ class AccountWorker:
                     self.start_foreground_session()
                     return
 
-            # PRIORITY 2: Fallback to OTP relogin ONLY if ENABLE_AUTO_OTP is explicitly enabled
-            if ENABLE_AUTO_OTP and '@freediamond.in' in self.email:
+            # PRIORITY 2: Fallback to OTP relogin for freediamond accounts
+            if '@freediamond.in' in self.email:
                 if self.auto_relogin_via_otp():
                     self.start_foreground_session()
             return
