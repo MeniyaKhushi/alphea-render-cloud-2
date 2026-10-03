@@ -20,6 +20,7 @@ GITHUB_FILE_PATH = 'accounts.json'
 ACCOUNTS_FILE = 'accounts.json'
 MASTER_INVITE_CODE = os.environ.get('MASTER_INVITE_CODE', '1F2C0Y5QG_')
 PAUSE_MODE = False  # ACTIVE: 24/7 Zero-Crash High-Efficiency Worker Pool
+ENABLE_AUTO_OTP = os.environ.get('ENABLE_AUTO_OTP', 'false').lower() == 'true'  # Cluster 2: Disabled by default to stop OTP spam loops
 
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
@@ -134,11 +135,8 @@ def sync_accounts_to_github():
     if not GITHUB_TOKEN:
         return False
 
-    # SAFETY GUARD: Never overwrite cluster-state with fewer than 10 accounts.
-    # This prevents a freshly-restarted server (with only 2-3 placeholder slots)
-    # from clobbering the 200-account snapshot stored in cluster-state.
-    if len(NODES) < 10:
-        add_log(f"GitHub sync SKIPPED: only {len(NODES)} nodes loaded (safety guard - need >=10 to sync)")
+    if len(NODES) < 1:
+        add_log(f"GitHub sync SKIPPED: zero nodes loaded")
         return False
 
     try:
@@ -321,6 +319,9 @@ class AccountWorker:
           3. POST VerifyEmailChallenge with code -> get fresh accessToken + refreshToken
           4. Inject new tokens, save to GitHub
         """
+        if not ENABLE_AUTO_OTP:
+            return False
+
         if '@freediamond.in' not in self.email:
             add_log(f"[{self.name}] Auto-relogin skipped (non-freediamond.in account: {self.email})")
             return False
@@ -496,9 +497,8 @@ class AccountWorker:
                 return True
             else:
                 if not self.jwt_exp or time.time() >= self.jwt_exp:
-                    add_log(f"[{self.name}] Refresh failed ({r.status_code}). Trying OTP auto-relogin...")
-                    # NEVER-DIE: Fall back to full OTP relogin for freediamond.in accounts
-                    if '@freediamond.in' in self.email:
+                    add_log(f"[{self.name}] Refresh failed ({r.status_code}).")
+                    if ENABLE_AUTO_OTP and '@freediamond.in' in self.email:
                         return self.auto_relogin_via_otp()
                     self.status = f"401 Invalid Refresh Token ({r.status_code})"
                     self.update_cluster_state()
@@ -1032,8 +1032,8 @@ class AccountWorker:
                     self.start_foreground_session()
                     return
 
-            # PRIORITY 2: Fallback to OTP relogin ONLY if token refresh failed/invalid
-            if '@freediamond.in' in self.email:
+            # PRIORITY 2: Fallback to OTP relogin ONLY if ENABLE_AUTO_OTP is explicitly enabled
+            if ENABLE_AUTO_OTP and '@freediamond.in' in self.email:
                 if self.auto_relogin_via_otp():
                     self.start_foreground_session()
             return
