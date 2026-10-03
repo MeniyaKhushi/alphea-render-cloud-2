@@ -841,12 +841,15 @@ class AccountWorker:
             self.check_redeem_balance()
             if quest_id == 'lifetime-welcome':
                 self.onboard_claimed = True
-                add_log(f"[{self.name}] Claimed Onboard Welcome 1,500 Pts!")
+                add_log(f"[{self.name}] 🎯 Claimed Onboard Welcome (+1,500 Pts)!")
             elif quest_id == 'daily-login-1':
                 self.daily_claimed = True
-                add_log(f"[{self.name}] Claimed Daily Check-in Quest (+600 Pts)!")
+                add_log(f"[{self.name}] 🎯 Claimed Daily Check-in Quest (+600 Pts)!")
+            elif 'daily-foreground' in quest_id:
+                pts = 600 if ('3600' in quest_id or '10800' in quest_id) else (1000 if '21600' in quest_id else 2000)
+                add_log(f"[{self.name}] 🎯 Heartbeat Auto-Claimed Milestone Quest {quest_id} (+{pts} Pts)!")
             else:
-                add_log(f"[{self.name}] Claimed Quest {quest_id}!")
+                add_log(f"[{self.name}] 🎯 Claimed Quest {quest_id}!")
             return True
         return False
 
@@ -1011,6 +1014,15 @@ class AccountWorker:
             self.update_cluster_state()
             delta_s = max(1, self.session_uptime - old_uptime)
             add_log(f"[{self.name}] Heartbeat ACK: Mining Active (+{delta_s}s, Total: {self.session_uptime}s)")
+
+            # Autonomous Milestone-Driven Auto Quest Claim Engine on Heartbeat:
+            milestones = [3600, 10800, 21600, 43200]
+            crossed_milestone = any(old_uptime < m <= self.session_uptime for m in milestones)
+            tick_c = getattr(self, 'tick_count', 0)
+            if crossed_milestone or tick_c == 1 or not self.daily_claimed or not self.onboard_claimed or (tick_c % 5 == 0):
+                self.fetch_and_claim_quests()
+                self.check_round_redeem_status()
+
             return True
         elif r and r.status_code == 400 and 'connect foreground session not active' in r.text:
             add_log(f"[{self.name}] Foreground session expired, renewing session ID...")
@@ -1069,14 +1081,9 @@ class AccountWorker:
             if not self.start_foreground_session():
                 return
 
-        # 4. Submit heartbeat (advances mining time by ~60s)
-        self.submit_heartbeat()
-
-        # 5. Periodic Points / Daily Quest status sync (NO auto-claim, NO auto-redeem: manual buttons only!)
+        # 4. Submit heartbeat (advances mining time & auto-claims completed quests on milestone)
         self.tick_count = getattr(self, 'tick_count', 0) + 1
-        if self.tick_count == 1 or self.tick_count % 10 == 0:
-            self.sync_daily_quest_state()
-            self.check_round_redeem_status()
+        self.submit_heartbeat()
 
     def run(self):
         self.tick()
@@ -1244,7 +1251,7 @@ HTML_TEMPLATE = """
         <span>•</span>
         <span class="tag-dynamic">⚡ Linear Micro-Stagger Engine: {{ total_nodes }} Nodes</span>
         <span>•</span>
-        <span>24/7 Pure Mining Cadence</span>
+        <span class="tag-dynamic" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.4); color: #34d399;"><i class="fa-solid fa-bolt-auto"></i> 24/7 Heartbeat Auto-Claim Active</span>
       </p>
     </div>
     <div class="btn-group">
@@ -1254,12 +1261,6 @@ HTML_TEMPLATE = """
       <button class="btn btn-redeem" style="background: linear-gradient(135deg, #334155, #1e293b); border: 1px solid rgba(148, 163, 184, 0.3); opacity: 0.95;" onclick="triggerRedeemAll()" title="Click to 1-Click Request Redeem across all accounts."><i class="fa-solid fa-gift"></i> 1-Click Request Redeem All <span class="stat-btn-time">[{{ last_redeem_all }}]</span></button>
       {% endif %}
       <button class="btn" style="background: linear-gradient(135deg, #3b82f6, #1d4ed8); border: none; color: #fff; font-weight: 700;" onclick="triggerClaimAll()" title="Stage 2: 1-Click Sponsored Claim token payouts to BSC wallets (Gas paid by Alphea)"><i class="fa-solid fa-trophy"></i> 🏆 1-Click Claim Tokens <span class="stat-btn-time">[{{ last_claim_all }}]</span></button>
-      {% if can_daily_checkin_any %}
-      <button class="btn btn-primary" onclick="triggerDailyCheckin()"><i class="fa-solid fa-calendar-check"></i> 1-Click Daily Check-in <span class="stat-btn-time">[{{ last_daily_checkin }}]</span></button>
-      {% else %}
-      <button class="btn" style="background: linear-gradient(135deg, #1e293b, #0f172a); border: 1px solid rgba(148, 163, 184, 0.25); color: #94a3b8;" onclick="triggerDailyCheckin()" title="Click to 1-Click sweep daily check-in anytime."><i class="fa-solid fa-check-double"></i> 1-Click Daily Check-in <span class="stat-btn-time">[{{ last_daily_checkin }}]</span></button>
-      {% endif %}
-      <button class="btn" style="background: linear-gradient(135deg, #8b5cf6, #6d28d9); border: none; color: #fff; font-weight: 700; box-shadow: 0 0 10px rgba(139, 92, 246, 0.35);" onclick="triggerClaimQuests()" title="Click to 1-Click sweep and claim all completed mining milestone quests across all nodes"><i class="fa-solid fa-bullseye"></i> 🎯 1-Click Claim Quests <span class="stat-btn-time">[{{ last_quests_claim }}]</span></button>
       <button class="btn" onclick="reviveCluster()"><i class="fa-solid fa-bolt"></i> Revive Nodes</button>
       <button class="btn" onclick="location.reload()"><i class="fa-solid fa-rotate-right"></i> Refresh</button>
     </div>
