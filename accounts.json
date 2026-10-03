@@ -34,7 +34,7 @@
     "email": "boyrisky083@gmail.com",
     "deviceId": "bfe19769970236e5",
     "proxy": "http://wtbhmkwu-5:wgkurrh625yw@p.webshare.io:80",
-    "location": "Poland (Warsaw)",
+    "location": "Direct Render VPS (Failover)",
     "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImJveXJpc2t5MDgzQGdtYWlsLmNvbSIsInNpZCI6IjMwMzNjNjNkLWM5NWItNGQzMy1iMzQyLTg3ZTBhNzI2YWRlOCIsImF1dGhfdGltZSI6MTc5MTAyNDAzOSwiaXNzIjoiYWxwaGVhLWNvbm5lY3QiLCJzdWIiOiIwZmJhNWYwMC03MDMwLTQ3ZjgtYWY3ZS1kOTJkM2ExOTEwMmIiLCJleHAiOjE3OTEwMzg5NTAsImlhdCI6MTc5MTAzNTM1MH0.vlhiwnVI87J64oXXaAsTI754hqcfxcr1UpIo0TAkWaY",
     "refreshToken": "jGWcHYQCYuqO36Td_OnqTyTUY2gujtCqjPs52rS4Szc",
     "enabled": true
@@ -735,8 +735,8 @@
     "deviceId": "9579a92ba8300e90",
     "proxy": null,
     "location": "Direct Render VPS",
-    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InBhYmxvMTk5MUBmcmVlZGlhbW9uZC5pbiIsInNpZCI6IjAxMzE1NzdkLTZmMGQtNDFmZi1iNzhjLTkwMTIwNmUwMGUwZCIsImF1dGhfdGltZSI6MTc5MTAyODQ3OSwiaXNzIjoiYWxwaGVhLWNvbm5lY3QiLCJzdWIiOiI1ZDE0MWZjNC0zYWUyLTQ0ZGEtODEyOS0yNGIxYThlNTNlYzIiLCJleHAiOjE3OTEwMzU1NjYsImlhdCI6MTc5MTAzMTk2Nn0.Cw39g9_9uKezthSIl0w8fD706xiKmiIQC9qoKvkbWu4",
-    "refreshToken": "-M0nY9t4ZMG12X_p9yIM4OgRu8rEyVh7nM0bOQaiRho",
+    "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InBhYmxvMTk5MUBmcmVlZGlhbW9uZC5pbiIsInNpZCI6IjAxMzE1NzdkLTZmMGQtNDFmZi1iNzhjLTkwMTIwNmUwMGUwZCIsImF1dGhfdGltZSI6MTc5MTAyODQ3OSwiaXNzIjoiYWxwaGVhLWNvbm5lY3QiLCJzdWIiOiI1ZDE0MWZjNC0zYWUyLTQ0ZGEtODEyOS0yNGIxYThlNTNlYzIiLCJleHAiOjE3OTEwMzkwNzksImlhdCI6MTc5MTAzNTQ3OX0.bo_fMXyx5gS7QbqvR_Z9MVYz2TRuszu5rTn7ru2pTr8",
+    "refreshToken": "W_wcS7b4z_EBlvTKP1y0M3AZfjhOEthtvdanTvNiVxY",
     "enabled": true
   },
   {
