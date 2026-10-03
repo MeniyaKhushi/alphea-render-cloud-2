@@ -234,10 +234,7 @@ class AccountWorker:
         if not self.access_token or '@alphea.local' in self.email:
             self.status = "Waiting for Sync"
         elif self.jwt_exp and time.time() >= self.jwt_exp:
-            if '@freediamond.in' in self.email:
-                self.status = "Session Expired (Awaiting OTP)"
-            else:
-                self.status = "401 Expired (Re-login Needed)"
+            self.status = "Session Expired (Awaiting Refresh)"
         else:
             self.status = "Connecting..."
 
@@ -302,7 +299,7 @@ class AccountWorker:
                         'name': n.name,
                         'email': n.email,
                         'deviceId': n.device_id,
-                        'proxy': None,
+                        'proxy': n.proxy,
                         'location': n.location,
                         'accessToken': n.access_token,
                         'refreshToken': n.refresh_token,
@@ -491,6 +488,8 @@ class AccountWorker:
                 if new_ref:
                     self.refresh_token = new_ref
 
+                self.status = 'Mining Active'
+                self.update_cluster_state()
                 self.save_updated_tokens()
                 self.consecutive_errors = 0
                 add_log(f"[{self.name}] Token refreshed successfully. Exp in ~{int((self.jwt_exp or time.time()) - time.time())//60}m")
@@ -1021,16 +1020,21 @@ class AccountWorker:
                 if '@freediamond.in' in self.email:
                     self.auto_relogin_via_otp()
 
-        # 2. Check 401 / Dead / Relogin state
-        if '401' in self.status or 'Dead' in self.status or 'Waiting for Sync' in self.status or 'Auto-Relogin' in self.status or 'Expired' in self.status:
+        # 2. Check 401 / Dead / Relogin / Expired state
+        if '401' in self.status or 'Dead' in self.status or 'Auto-Relogin' in self.status or 'Expired' in self.status:
             now = time.time()
             if hasattr(self, '_last_relogin_attempt') and (now - self._last_relogin_attempt) < 300:
                 return
+
+            # PRIORITY 1: Ultra-fast gRPC RefreshSession token renewal (200ms, ZERO OTP required)
+            if self.refresh_token:
+                if self.refresh_access_token():
+                    self.start_foreground_session()
+                    return
+
+            # PRIORITY 2: Fallback to OTP relogin ONLY if token refresh failed/invalid
             if '@freediamond.in' in self.email:
                 if self.auto_relogin_via_otp():
-                    self.start_foreground_session()
-            elif self.refresh_token:
-                if self.refresh_access_token():
                     self.start_foreground_session()
             return
 
@@ -1502,6 +1506,7 @@ def route_update_account():
     new_access = data.get('accessToken')
     new_refresh = data.get('refreshToken')
     dev_id = data.get('deviceId')
+    slot = data.get('slot')
 
     if not new_access or not new_refresh:
         return jsonify({'error': 'Missing accessToken or refreshToken'}), 400
@@ -1511,21 +1516,30 @@ def route_update_account():
     is_new_spawner = False
 
     with NODES_LOCK:
-        # 1. Match existing account by email (case-insensitive)
-        if email_clean:
+        # 1. Direct Slot Selection (e.g. from extension manual slot selector 0..4)
+        if slot is not None and str(slot).lower() not in ['auto', 'new', '']:
+            try:
+                slot_idx = int(slot)
+                if 0 <= slot_idx < len(NODES):
+                    target_node = NODES[slot_idx]
+            except Exception:
+                pass
+
+        # 2. Match existing account by email (case-insensitive)
+        if not target_node and email_clean:
             for node in NODES:
                 if node.email and node.email.lower() == email_clean.lower():
                     target_node = node
                     break
 
-        # 2. Look for an unassigned placeholder slot (@alphea.local) ONLY
-        if not target_node:
+        # 3. Look for an unassigned placeholder slot (@alphea.local) ONLY
+        if not target_node and str(slot).lower() != 'new':
             for node in NODES:
                 if '@alphea.local' in node.email.lower() or not node.email:
                     target_node = node
                     break
 
-        # 3. DYNAMIC +1 NODE SPAWNER:
+        # 4. DYNAMIC +1 NODE SPAWNER:
         # If all existing slots have real accounts, dynamically spawn a brand new Node!
         if not target_node:
             is_new_spawner = True
@@ -1544,7 +1558,7 @@ def route_update_account():
             target_node = AccountWorker(new_idx, account_data)
             NODES.append(target_node)
 
-        # Update node data
+        # Update node data (preserving existing proxy!)
         target_node.access_token = new_access
         target_node.refresh_token = new_refresh
         if email_clean:
@@ -1582,9 +1596,11 @@ def route_update_account():
     res = jsonify({
         'success': True,
         'name': target_node.name,
+        'slot': target_node.index,
+        'proxy_preserved': bool(target_node.proxy),
         'is_new_node': is_new_spawner,
         'total_nodes': len(NODES),
-        'message': f"Revived {email_clean or target_node.name} on {target_node.name} (Total: {len(NODES)} Nodes Active)!"
+        'message': f"Revived {email_clean or target_node.name} on {target_node.name} (Proxy: {'Webshare' if target_node.proxy else 'Direct VPS'})!"
     })
     res.headers.add('Access-Control-Allow-Origin', '*')
     return res, 200
