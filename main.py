@@ -131,7 +131,10 @@ def fetch_accounts_from_github():
         add_log(f"GitHub fetch note: {e}")
     return None
 
-def sync_accounts_to_github():
+LAST_GITHUB_SYNC = 0
+GITHUB_SYNC_LOCK = threading.Lock()
+
+def sync_accounts_to_github(force=False):
     # Decoupled State Branch: Commit to 'cluster-state' NEVER to 'main'
     # This prevents Render auto-deploy reboot loops when sessions update!
     if not GITHUB_TOKEN:
@@ -141,53 +144,66 @@ def sync_accounts_to_github():
         add_log(f"GitHub sync SKIPPED: zero nodes loaded")
         return False
 
-    try:
-        if not os.path.exists(ACCOUNTS_FILE):
+    # BANDWIDTH OPTIMIZATION (99% Reduction):
+    # Debounce automatic syncs to at most once every 30 minutes (1800s).
+    # Force syncs (manual admin actions, critical saves) bypass the cooldown.
+    global LAST_GITHUB_SYNC
+    now = time.time()
+    if not force and (now - LAST_GITHUB_SYNC) < 1800:
+        return False
+
+    with GITHUB_SYNC_LOCK:
+        if not force and (time.time() - LAST_GITHUB_SYNC) < 1800:
             return False
-        with open(ACCOUNTS_FILE, 'r') as f:
-            local_content = f.read()
+        LAST_GITHUB_SYNC = time.time()
 
-        branch_name = 'cluster-state'
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
-        headers = {
-            'Authorization': f"token {GITHUB_TOKEN}",
-            'Accept': 'application/vnd.github.v3+json'
-        }
+        try:
+            if not os.path.exists(ACCOUNTS_FILE):
+                return False
+            with open(ACCOUNTS_FILE, 'r') as f:
+                local_content = f.read()
 
-        # Get current sha from cluster-state branch
-        sha = None
-        r = requests.get(f"{url}?ref={branch_name}", headers=headers, timeout=12)
-        if r.status_code == 200:
-            sha = r.json().get('sha')
-        elif r.status_code == 404:
-            r_main = requests.get(url, headers=headers, timeout=12)
-            if r_main.status_code == 200:
-                sha = r_main.json().get('sha')
+            branch_name = 'cluster-state'
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}"
+            headers = {
+                'Authorization': f"token {GITHUB_TOKEN}",
+                'Accept': 'application/vnd.github.v3+json'
+            }
 
-        payload = {
-            'message': f"Auto-sync updated cluster sessions [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]",
-            'content': base64.b64encode(local_content.encode('utf-8')).decode('utf-8'),
-            'branch': branch_name
-        }
-        if sha:
-            payload['sha'] = sha
+            # Get current sha from cluster-state branch
+            sha = None
+            r = requests.get(f"{url}?ref={branch_name}", headers=headers, timeout=12)
+            if r.status_code == 200:
+                sha = r.json().get('sha')
+            elif r.status_code == 404:
+                r_main = requests.get(url, headers=headers, timeout=12)
+                if r_main.status_code == 200:
+                    sha = r_main.json().get('sha')
 
-        put_r = requests.put(url, headers=headers, json=payload, timeout=20)
-        if put_r.status_code in [200, 201]:
-            add_log(f"Synced {len(NODES)} accounts to branch '{branch_name}' (Zero-Reboot)")
-            return True
-        elif put_r.status_code == 409:
-            r2 = requests.get(f"{url}?ref={branch_name}", headers=headers, timeout=12)
-            if r2.status_code == 200:
-                payload['sha'] = r2.json().get('sha')
-                put_r2 = requests.put(url, headers=headers, json=payload, timeout=20)
-                if put_r2.status_code in [200, 201]:
-                    add_log(f"Synced accounts to branch '{branch_name}' (retry success)")
-                    return True
-        add_log(f"GitHub sync note: {put_r.status_code}")
-    except Exception as e:
-        add_log(f"Exception syncing accounts to '{branch_name}': {e}")
-    return False
+            payload = {
+                'message': f"Auto-sync updated cluster sessions [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]",
+                'content': base64.b64encode(local_content.encode('utf-8')).decode('utf-8'),
+                'branch': branch_name
+            }
+            if sha:
+                payload['sha'] = sha
+
+            put_r = requests.put(url, headers=headers, json=payload, timeout=20)
+            if put_r.status_code in [200, 201]:
+                add_log(f"Synced {len(NODES)} accounts to branch '{branch_name}' (Bandwidth-Optimized)")
+                return True
+            elif put_r.status_code == 409:
+                r2 = requests.get(f"{url}?ref={branch_name}", headers=headers, timeout=12)
+                if r2.status_code == 200:
+                    payload['sha'] = r2.json().get('sha')
+                    put_r2 = requests.put(url, headers=headers, json=payload, timeout=20)
+                    if put_r2.status_code in [200, 201]:
+                        add_log(f"Synced accounts to branch '{branch_name}' (retry success)")
+                        return True
+            add_log(f"GitHub sync note: {put_r.status_code}")
+        except Exception as e:
+            add_log(f"Exception syncing accounts to '{branch_name}': {e}")
+        return False
 
 # ---------------- DYNAMIC NODE WORKER ----------------
 class AccountWorker:
@@ -1091,7 +1107,7 @@ class AccountWorker:
             milestones = [3600, 10800, 21600, 43200]
             crossed_milestone = any(old_uptime < m <= self.session_uptime for m in milestones)
             tick_c = getattr(self, 'tick_count', 0)
-            if crossed_milestone or tick_c == 1 or not self.daily_claimed or not self.onboard_claimed or (tick_c % 5 == 0):
+            if crossed_milestone or tick_c == 1 or not self.daily_claimed or not self.onboard_claimed or (tick_c % 30 == 0):
                 self.fetch_and_claim_quests()
                 self.check_round_redeem_status()
 
@@ -1689,6 +1705,7 @@ def route_update_account():
         try:
             node.get_effective_wallet()
             node.save_updated_tokens()
+            sync_accounts_to_github(force=True)
             node.start_foreground_session()
             node.fetch_and_claim_quests()
             node.check_round_redeem_status()
