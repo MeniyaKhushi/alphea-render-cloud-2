@@ -234,7 +234,12 @@ class AccountWorker:
         if not self.access_token or '@alphea.local' in self.email:
             self.status = "Waiting for Sync"
         elif self.jwt_exp and time.time() >= self.jwt_exp:
-            self.status = "Session Expired (Awaiting Refresh)"
+            if self.refresh_token:
+                self.status = "Connecting..."
+            elif '@freediamond.in' in self.email:
+                self.status = "Session Expired (Awaiting OTP)"
+            else:
+                self.status = "401 Expired (Re-login Needed)"
         else:
             self.status = "Connecting..."
 
@@ -248,7 +253,9 @@ class AccountWorker:
         elif not self.access_token or '@alphea.local' in self.email:
             self.status = "Waiting for Sync"
         elif self.jwt_exp and time.time() >= self.jwt_exp:
-            if '@freediamond.in' in self.email:
+            if self.refresh_token:
+                self.status = "Connecting..."
+            elif '@freediamond.in' in self.email:
                 self.status = "Session Expired (Awaiting OTP)"
             else:
                 self.status = "401 Expired (Re-login Needed)"
@@ -263,10 +270,11 @@ class AccountWorker:
     def update_cluster_state(self):
         exp_sec = max(0, int((self.jwt_exp or time.time()) - time.time())) if self.jwt_exp else 0
         if self.jwt_exp and time.time() >= self.jwt_exp and self.status == 'Mining Active':
-            if '@freediamond.in' in self.email:
-                self.status = "Session Expired (Awaiting OTP)"
-            else:
-                self.status = "401 Expired (Re-login Needed)"
+            if not self.refresh_token:
+                if '@freediamond.in' in self.email:
+                    self.status = "Session Expired (Awaiting OTP)"
+                else:
+                    self.status = "401 Expired (Re-login Needed)"
         CLUSTER_STATE[str(self.index)] = {
             'name': self.name,
             'email': self.email,
