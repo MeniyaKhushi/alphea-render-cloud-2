@@ -360,8 +360,8 @@ class AccountWorker:
 
                 # Step 1: Request OTP challenge
                 r = self.session.post(auth_url, headers=headers,
-                                      json={'email': self.email, 'delivery': 'EMAIL_DELIVERY_OTP'},
-                                      timeout=20)
+                                  json={'email': self.email, 'delivery': 'EMAIL_DELIVERY_OTP'},
+                                  timeout=35)
                 if r.status_code != 200:
                     add_log(f"[{self.name}] OTP request failed: {r.status_code} {r.text[:80]}")
                     self.status = f"Auto-Relogin Failed ({r.status_code})"
@@ -408,7 +408,7 @@ class AccountWorker:
                 vr = None
                 for v_att in range(2):
                     try:
-                        vr = self.session.post(verify_url, headers=headers, json=verify_payload, timeout=25)
+                        vr = self.session.post(verify_url, headers=headers, json=verify_payload, timeout=35)
                         if vr.status_code == 200:
                             break
                         elif vr.status_code in (408, 429, 500, 502, 503, 504):
@@ -500,7 +500,8 @@ class AccountWorker:
         last_resp = None
         for attempt in range(2):
             try:
-                r = self.session.post(url, headers=headers, json=payload, timeout=20)
+                # 35s timeout to handle severe Alphea server lag gracefully
+                r = self.session.post(url, headers=headers, json=payload, timeout=35)
                 last_resp = r
                 if r.status_code == 200:
                     data = r.json()
@@ -514,43 +515,40 @@ class AccountWorker:
                     if new_ref:
                         self.refresh_token = new_ref
 
-                    self.status = 'Mining Active'
-                    self.update_cluster_state()
                     self.save_updated_tokens()
                     self.consecutive_errors = 0
                     add_log(f"[{self.name}] Token refreshed successfully. Exp in ~{int((self.jwt_exp or time.time()) - time.time())//60}m")
                     return True
                 elif r.status_code in (408, 429, 500, 502, 503, 504):
-                    time.sleep(1.8)
+                    time.sleep(2.0)
                     continue
                 else:
                     break
             except Exception:
                 if attempt == 0:
-                    time.sleep(1.8)
+                    time.sleep(2.0)
                     continue
                 break
 
         if last_resp is not None:
-            if not self.jwt_exp or time.time() >= self.jwt_exp:
+            # ONLY trigger OTP auto-relogin if Alphea explicitly rejected token credentials (400 / 401)
+            if last_resp.status_code in (400, 401):
+                add_log(f"[{self.name}] Refresh token rejected ({last_resp.status_code}).")
                 if '@freediamond.in' in self.email:
-                    add_log(f"[{self.name}] Refresh failed ({last_resp.status_code}). Initiating OTP auto-relogin...")
                     return self.auto_relogin_via_otp()
-                else:
-                    add_log(f"[{self.name}] Refresh failed ({last_resp.status_code}). Manual account awaiting Extension sync.")
-                    self.status = "401 Expired (Re-sync via Extension)"
-                    self.update_cluster_state()
-                    return False
-            add_log(f"[{self.name}] Refresh failed: {last_resp.status_code} {last_resp.text[:80]}")
+                self.status = f"401 Session Dead (Re-login needed)"
+                self.update_cluster_state()
+            else:
+                # Server transient error (500, 502, 503, 504, 429) -> DO NOT destroy session or mark 401!
+                add_log(f"[{self.name}] Alphea Auth Notice: HTTP {last_resp.status_code} (Transient, retrying next cycle)")
+                self.status = f"⚠️ Server Busy ({last_resp.status_code})"
+                self.update_cluster_state()
             return False
         else:
-            if not self.jwt_exp or time.time() >= self.jwt_exp:
-                if '@freediamond.in' in self.email:
-                    add_log(f"[{self.name}] Refresh timed out. Initiating OTP auto-relogin...")
-                    return self.auto_relogin_via_otp()
-                else:
-                    self.status = "Token Refresh Network Error"
-                    self.update_cluster_state()
+            # Network Timeout (>35s) -> DO NOT spam OTP or mark dead!
+            add_log(f"[{self.name}] Token refresh timed out (>35s). Preserving session for retry.")
+            self.status = "⚠️ Server Timeout (Retrying...)"
+            self.update_cluster_state()
             return False
 
     def authenticated_rpc(self, path, payload=None):
@@ -570,12 +568,12 @@ class AccountWorker:
 
         for attempt in range(2):
             try:
-                r = self.session.post(url, headers=headers, json=payload, timeout=15)
+                r = self.session.post(url, headers=headers, json=payload, timeout=35)
                 if r.status_code == 401:
                     add_log(f"[{self.name}] 401 on {path.split('/')[-1]}, attempting refresh...")
                     if self.refresh_access_token():
                         headers['Authorization'] = f"Bearer {self.access_token}"
-                        r = self.session.post(url, headers=headers, json=payload, timeout=15)
+                        r = self.session.post(url, headers=headers, json=payload, timeout=35)
                     else:
                         self.status = '401 Session Dead (Re-login needed)'
                         self.update_cluster_state()
@@ -611,8 +609,13 @@ class AccountWorker:
             return True
         elif r and r.status_code == 401:
             self.status = '401 Session Dead (Re-login needed)'
+        elif r and r.status_code in (500, 502, 503, 504):
+            self.status = f"⚠️ Server Busy ({r.status_code})"
+            add_log(f"[{self.name}] StartForegroundSession notice: HTTP {r.status_code}")
         else:
-            err = r.text[:80] if r else 'Timeout'
+            err = r.text[:80] if r else 'Timeout (>35s)'
+            if not r:
+                self.status = '⚠️ Server Timeout (Retrying...)'
             add_log(f"[{self.name}] StartForegroundSession notice: {err}")
         self.update_cluster_state()
         return False
@@ -716,12 +719,26 @@ class AccountWorker:
 
             self.update_cluster_state()
             return data
+        elif r and r.status_code == 503:
+            self.redeem_status_text = "⚠️ Round Service 503 (Maintenance)"
+            self.can_redeem = False
+            self.update_cluster_state()
+            return {'round_busy': True, 'code': 503}
+        elif not r:
+            self.redeem_status_text = "⚠️ Reward RPC Timeout (>35s)"
+            self.can_redeem = False
+            self.update_cluster_state()
+            return {'round_timeout': True}
         return None
 
     def request_redeem(self):
         status_data = self.check_round_redeem_status()
         if not status_data:
-            return {'success': False, 'message': 'Could not query round status'}
+            return {'success': False, 'message': 'Could not query round status (Network/Server Error)'}
+        if status_data.get('round_busy'):
+            return {'success': False, 'message': 'Alphea Reward Service Under Maintenance (503 Unavailable) - Points are 100% safe!'}
+        if status_data.get('round_timeout'):
+            return {'success': False, 'message': 'Alphea Reward Gateway Timeout (>35s) - Server lag, please retry shortly!'}
 
         round_id = status_data.get('roundId')
         wallet_address = status_data.get('pinnedWalletAddress') or self.get_effective_wallet()
@@ -1070,10 +1087,17 @@ class AccountWorker:
             add_log(f"[{self.name}] Foreground session expired, renewing session ID...")
             self.start_foreground_session()
             return False
-        else:
-            err_msg = r.text[:60] if r else 'Network Timeout'
+        elif r and r.status_code in (500, 502, 503, 504):
             self.consecutive_errors += 1
-            if self.consecutive_errors > 4:
+            add_log(f"[{self.name}] Heartbeat server notice: HTTP {r.status_code} (Alphea server busy, retrying in 60s)")
+            if self.consecutive_errors > 8:
+                self.session_id = None
+            self.update_cluster_state()
+            return False
+        else:
+            err_msg = r.text[:60] if r else 'Network Timeout (>35s)'
+            self.consecutive_errors += 1
+            if self.consecutive_errors > 8:
                 self.session_id = None
             if self.consecutive_errors >= 2:
                 add_log(f"[{self.name}] Heartbeat notice: {err_msg} (Retry in 60s)")
