@@ -792,8 +792,10 @@ class AccountWorker:
             if pkey and pkey != 'lifetime' and pkey != self.current_period_key:
                 self.current_period_key = pkey
                 self.daily_claimed = False
+                self.session_uptime = 0
                 self.failed_claim_cache.clear()
-                add_log(f"[{self.name}] 🌅 Rolled over to new day ({pkey}). Daily check-in reset to Pending.")
+                add_log(f"[{self.name}] 🌅 Rolled over to new day ({pkey}). Renewing session for new day...")
+                self.start_foreground_session()
 
             if qid == 'lifetime-welcome':
                 self.onboard_claimed = (state == 'QUEST_STATE_CLAIMED')
@@ -1014,6 +1016,13 @@ class AccountWorker:
             self.update_cluster_state()
             delta_s = max(1, self.session_uptime - old_uptime)
             add_log(f"[{self.name}] Heartbeat ACK: Mining Active (+{delta_s}s, Total: {self.session_uptime}s)")
+
+            # Auto 24-Hour Session Renewal:
+            # If accumulatedValidSeconds reaches 86,400s (24h Alphea ceiling), renew session
+            if self.session_uptime >= 86400:
+                add_log(f"[{self.name}] 🔄 24h Session Limit reached (86,400s). Renewing foreground session...")
+                self.session_uptime = 0
+                self.start_foreground_session()
 
             # Autonomous Milestone-Driven Auto Quest Claim Engine on Heartbeat:
             milestones = [3600, 10800, 21600, 43200]
@@ -1642,13 +1651,12 @@ def route_revive_cluster():
                 continue
             try:
                 node.consecutive_errors = 0
-                if not node.is_alive():
-                    node.start()
-                else:
-                    node.start_foreground_session()
+                node.session_uptime = 0
+                node.start_foreground_session()
+                node.fetch_and_claim_quests()
             except Exception as e:
                 add_log(f"[{node.name}] Revive error: {e}")
-            time.sleep(random.uniform(1.2, 2.2))
+            time.sleep(random.uniform(0.1, 0.2))
         add_log("[REVIVE] Cluster revival sequence completed successfully!")
 
     threading.Thread(target=revive_runner, daemon=True).start()
