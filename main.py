@@ -404,17 +404,31 @@ class AccountWorker:
                     time.sleep(2.0)
                     return False
 
-                # Step 3: Verify OTP and get fresh tokens
-                verify_payload = {
-                    'challenge_id': challenge_id,
-                    'email': self.email,
-                    'code': otp_code
-                }
-                vr = self.session.post(verify_url, headers=headers, json=verify_payload, timeout=20)
-                if vr.status_code != 200:
-                    add_log(f"[{self.name}] OTP verify failed: {vr.status_code} {vr.text[:80]}")
-                    self.status = f"Auto-Relogin: Verify Failed ({vr.status_code})"
+                # Step 3: Verify OTP and get fresh tokens (with 2-attempt retry on transient network timeout)
+                vr = None
+                for v_att in range(2):
+                    try:
+                        vr = self.session.post(verify_url, headers=headers, json=verify_payload, timeout=25)
+                        if vr.status_code == 200:
+                            break
+                        elif vr.status_code in (408, 429, 500, 502, 503, 504):
+                            time.sleep(2.0)
+                            continue
+                        else:
+                            break
+                    except Exception as ve:
+                        if v_att == 0:
+                            time.sleep(2.0)
+                            continue
+                        raise ve
+
+                if not vr or vr.status_code != 200:
+                    err_status = vr.status_code if vr else "Timeout"
+                    err_text = vr.text[:80] if vr else "Timeout"
+                    add_log(f"[{self.name}] OTP verify failed: {err_status} {err_text}")
+                    self.status = f"Auto-Relogin: Verify Failed ({err_status})"
                     self.update_cluster_state()
+                    self._last_relogin_attempt = time.time() - 240
                     time.sleep(2.0)
                     return False
 
@@ -451,6 +465,7 @@ class AccountWorker:
                 add_log(f"[{self.name}] Auto-relogin exception: {e}")
                 self.status = "Auto-Relogin: Error"
                 self.update_cluster_state()
+                self._last_relogin_attempt = time.time() - 240
                 time.sleep(2.0)
                 return False
         finally:
@@ -482,42 +497,60 @@ class AccountWorker:
         # Use correct camelCase field name for Alphea Connect gRPC
         payload = {'refreshToken': self.refresh_token}
 
-        try:
-            r = self.session.post(url, headers=headers, json=payload, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                s_info = data.get('session', {})
-                new_acc = s_info.get('accessToken')
-                new_ref = s_info.get('refreshToken')
+        last_resp = None
+        for attempt in range(2):
+            try:
+                r = self.session.post(url, headers=headers, json=payload, timeout=20)
+                last_resp = r
+                if r.status_code == 200:
+                    data = r.json()
+                    s_info = data.get('session', {})
+                    new_acc = s_info.get('accessToken')
+                    new_ref = s_info.get('refreshToken')
 
-                if new_acc:
-                    self.access_token = new_acc
-                    self.jwt_exp = decode_jwt_exp(new_acc)
-                if new_ref:
-                    self.refresh_token = new_ref
+                    if new_acc:
+                        self.access_token = new_acc
+                        self.jwt_exp = decode_jwt_exp(new_acc)
+                    if new_ref:
+                        self.refresh_token = new_ref
 
-                self.status = 'Mining Active'
-                self.update_cluster_state()
-                self.save_updated_tokens()
-                self.consecutive_errors = 0
-                add_log(f"[{self.name}] Token refreshed successfully. Exp in ~{int((self.jwt_exp or time.time()) - time.time())//60}m")
-                return True
-            else:
-                if not self.jwt_exp or time.time() >= self.jwt_exp:
-                    if '@freediamond.in' in self.email:
-                        add_log(f"[{self.name}] Refresh failed ({r.status_code}). Initiating OTP auto-relogin...")
-                        return self.auto_relogin_via_otp()
-                    else:
-                        add_log(f"[{self.name}] Refresh failed ({r.status_code}). Manual account awaiting Extension sync.")
-                        self.status = "401 Expired (Re-sync via Extension)"
-                        self.update_cluster_state()
-                        return False
-                add_log(f"[{self.name}] Refresh failed: {r.status_code} {r.text[:80]}")
-                return False
-        except Exception as e:
+                    self.status = 'Mining Active'
+                    self.update_cluster_state()
+                    self.save_updated_tokens()
+                    self.consecutive_errors = 0
+                    add_log(f"[{self.name}] Token refreshed successfully. Exp in ~{int((self.jwt_exp or time.time()) - time.time())//60}m")
+                    return True
+                elif r.status_code in (408, 429, 500, 502, 503, 504):
+                    time.sleep(1.8)
+                    continue
+                else:
+                    break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(1.8)
+                    continue
+                break
+
+        if last_resp is not None:
             if not self.jwt_exp or time.time() >= self.jwt_exp:
-                self.status = "Token Refresh Network Error"
-                self.update_cluster_state()
+                if '@freediamond.in' in self.email:
+                    add_log(f"[{self.name}] Refresh failed ({last_resp.status_code}). Initiating OTP auto-relogin...")
+                    return self.auto_relogin_via_otp()
+                else:
+                    add_log(f"[{self.name}] Refresh failed ({last_resp.status_code}). Manual account awaiting Extension sync.")
+                    self.status = "401 Expired (Re-sync via Extension)"
+                    self.update_cluster_state()
+                    return False
+            add_log(f"[{self.name}] Refresh failed: {last_resp.status_code} {last_resp.text[:80]}")
+            return False
+        else:
+            if not self.jwt_exp or time.time() >= self.jwt_exp:
+                if '@freediamond.in' in self.email:
+                    add_log(f"[{self.name}] Refresh timed out. Initiating OTP auto-relogin...")
+                    return self.auto_relogin_via_otp()
+                else:
+                    self.status = "Token Refresh Network Error"
+                    self.update_cluster_state()
             return False
 
     def authenticated_rpc(self, path, payload=None):
@@ -1819,7 +1852,7 @@ def route_redeem_all():
                     add_log(f"[{node.name}] Request Redeem: {msg}")
                 except Exception as e:
                     add_log(f"[{node.name}] Request Redeem error: {e}")
-                time.sleep(random.uniform(0.8, 1.4))
+                time.sleep(random.uniform(1.8, 2.5))
             add_log(f"[REDEEM ALL] Sequence completed at {get_ist_now_str()}! Redeemed: {success_count} | Already Redeemed (Untouched): {already_count} | Below Min (<3k): {below_min_count} | Standby/No Wallet: {ineligible_count} | Skipped: {skipped_cnt}")
         finally:
             with SWEEP_LOCK:
