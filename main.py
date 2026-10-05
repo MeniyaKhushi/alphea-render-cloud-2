@@ -413,6 +413,11 @@ class AccountWorker:
                     return False
 
                 # Step 3: Verify OTP and get fresh tokens (with 2-attempt retry on transient network timeout)
+                verify_payload = {
+                    'email': self.email,
+                    'challengeId': challenge_id,
+                    'code': otp_code
+                }
                 vr = None
                 for v_att in range(2):
                     try:
