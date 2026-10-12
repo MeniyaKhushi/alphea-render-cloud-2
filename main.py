@@ -9,6 +9,7 @@ import threading
 import requests
 import random
 import concurrent.futures
+import queue
 from flask import Flask, jsonify, request, render_template_string
 
 # ---------------- CONFIGURATION ----------------
@@ -40,6 +41,27 @@ LOGS_LOCK = threading.Lock()
 NODES_LOCK = threading.Lock()
 OTP_LOCK = threading.Lock()
 SESSION_START_LOCK = threading.Lock()
+
+# Dedicated Background Never-Die Auto-Relogin Queue
+RELOGIN_QUEUE = queue.Queue()
+RELOGIN_QUEUED_SET = set()
+RELOGIN_LOCK = threading.Lock()
+
+def enqueue_for_relogin(node):
+    if not node or not node.email or '@freediamond.in' not in node.email:
+        if node:
+            node.status = "401 Expired (Re-login Needed)"
+            node.update_cluster_state()
+        return False
+    with RELOGIN_LOCK:
+        if node.index not in RELOGIN_QUEUED_SET:
+            RELOGIN_QUEUED_SET.add(node.index)
+            RELOGIN_QUEUE.put(node)
+            node.status = "Queued for Auto-Relogin"
+            node.update_cluster_state()
+            add_log(f"[{node.name}] Enqueued for background Never-Die OTP relogin")
+            return True
+    return False
 CLUSTER_STATE = {}
 NODES = []
 START_TIME = time.time()
@@ -507,7 +529,7 @@ class AccountWorker:
             self.update_cluster_state()
             # If freediamond.in account, attempt full OTP relogin
             if '@freediamond.in' in self.email:
-                return self.auto_relogin_via_otp()
+                enqueue_for_relogin(self)
             return False
 
         # Throttle refreshes to at most once per 60s
@@ -565,7 +587,8 @@ class AccountWorker:
             if last_resp.status_code in (400, 401):
                 add_log(f"[{self.name}] Refresh token rejected ({last_resp.status_code}).")
                 if '@freediamond.in' in self.email:
-                    return self.auto_relogin_via_otp()
+                    enqueue_for_relogin(self)
+                    return False
                 self.status = f"401 Session Dead (Re-login needed)"
                 self.update_cluster_state()
             else:
@@ -605,8 +628,11 @@ class AccountWorker:
                         headers['Authorization'] = f"Bearer {self.access_token}"
                         r = self.session.post(url, headers=headers, json=payload, timeout=timeout)
                     else:
-                        self.status = '401 Session Dead (Re-login needed)'
-                        self.update_cluster_state()
+                        if '@freediamond.in' in self.email:
+                            enqueue_for_relogin(self)
+                        else:
+                            self.status = '401 Session Dead (Re-login needed)'
+                            self.update_cluster_state()
                 return r
             except (requests.exceptions.ProxyError, requests.exceptions.SSLError, requests.exceptions.ConnectTimeout) as pe:
                 if getattr(self, 'proxy', None) and self.session.proxies:
@@ -671,7 +697,11 @@ class AccountWorker:
                             self.update_cluster_state()
                             add_log(f"[{self.name}] Started Foreground Session after token renewal: {self.session_id[:8]}...")
                             return True
-                self.status = '401 Session Dead (Re-login needed)'
+                if '@freediamond.in' in self.email:
+                    enqueue_for_relogin(self)
+                else:
+                    self.status = '401 Session Dead (Re-login needed)'
+                    self.update_cluster_state()
             elif r and r.status_code in (500, 502, 503, 504):
                 self.status = f"⚠️ Server Busy ({r.status_code})"
                 self.consecutive_errors += 1
@@ -685,7 +715,10 @@ class AccountWorker:
                 err = r.text[:80] if r else 'Timeout (>20s)'
                 self.consecutive_errors += 1
                 if not r:
-                    self.status = '⚠️ Server Timeout (Retrying...)'
+                    if '@freediamond.in' in self.email and not self.session_id and self.balance == 0:
+                        enqueue_for_relogin(self)
+                    else:
+                        self.status = '⚠️ Server Timeout (Retrying...)'
                     try:
                         self.session.close()
                     except Exception:
@@ -1191,30 +1224,26 @@ class AccountWorker:
             self.update_cluster_state()
             return
 
-        # 1. Proactive JWT renewal (2 min before exp)
+        # 1. Proactive JWT renewal (2 min before exp) - Silent Refresh Token Only
         if self.jwt_exp and time.time() > (self.jwt_exp - 120):
             if not self.refresh_access_token():
                 if '@freediamond.in' in self.email:
-                    if self.auto_relogin_via_otp():
-                        self.start_foreground_session()
+                    enqueue_for_relogin(self)
                 return
 
-        # 2. Check 401 / Dead / Relogin / Expired / Error state
-        if '401' in self.status or 'Dead' in self.status or 'Auto-Relogin' in self.status or 'Expired' in self.status or 'Error' in self.status:
-            now = time.time()
-            if hasattr(self, '_last_relogin_attempt') and (now - self._last_relogin_attempt) < 300:
+        # 2. Check 401 / Dead / Relogin / Expired / Queued state - Token-First Safe Guard
+        if '401' in self.status or 'Dead' in self.status or 'Waiting for Sync' in self.status or 'Auto-Relogin' in self.status or 'Expired' in self.status or 'Queued' in self.status or (not self.session_id and self.balance == 0 and 'Timeout' in self.status):
+            # If already queued or in progress by ReloginDaemon, exit immediately so worker threads stay 100% free
+            if 'Auto-Relogin' in self.status or 'Queued' in self.status:
                 return
-
-            # PRIORITY 1: Ultra-fast gRPC RefreshSession token renewal (200ms, ZERO OTP required)
-            if self.refresh_token:
+            # First Priority: ALWAYS try silent refresh token first without requesting OTP!
+            if self.refresh_token and 'Invalid' not in self.status:
                 if self.refresh_access_token():
                     self.start_foreground_session()
                     return
-
-            # PRIORITY 2: Fallback to OTP relogin for freediamond accounts
+            # Second Priority: Enqueue to background Never-Die Relogin Daemon
             if '@freediamond.in' in self.email:
-                if self.auto_relogin_via_otp():
-                    self.start_foreground_session()
+                enqueue_for_relogin(self)
             return
 
         # 3. Ensure foreground session is active
@@ -1284,6 +1313,63 @@ class ClusterDispatcher(threading.Thread):
             add_log(f"[{node.name}] Tick error: {e}")
 
 cluster_dispatcher_instance = None
+
+# ---------------- DEDICATED BACKGROUND NEVER-DIE RELOGIN DAEMON ----------------
+class ReloginDaemon(threading.Thread):
+    def __init__(self):
+        super().__init__(name="ReloginDaemon", daemon=True)
+        self.is_running = True
+
+    def run(self):
+        add_log("[RELOGIN DAEMON] Dedicated background Never-Die OTP worker started.")
+        time.sleep(5)
+        while self.is_running:
+            if PAUSE_MODE:
+                time.sleep(5)
+                continue
+
+            target_node = None
+            try:
+                target_node = RELOGIN_QUEUE.get(timeout=3)
+            except queue.Empty:
+                with NODES_LOCK:
+                    for n in NODES:
+                        if '@freediamond.in' in n.email:
+                            is_dead = (
+                                '401' in n.status or 
+                                'Dead' in n.status or 
+                                'Expired' in n.status or 
+                                not n.access_token or
+                                (not n.session_id and n.balance == 0 and ('Timeout' in n.status or 'Connecting' in n.status))
+                            )
+                            if is_dead and n.index not in RELOGIN_QUEUED_SET:
+                                enqueue_for_relogin(n)
+                                break
+                time.sleep(2)
+                continue
+
+            try:
+                add_log(f"[RELOGIN DAEMON] Processing OTP auto-relogin for {target_node.name} ({target_node.email})...")
+                success = target_node.auto_relogin_via_otp()
+                if success:
+                    if not target_node.session_id:
+                        target_node.start_foreground_session()
+                    target_node.fetch_and_claim_quests()
+                    target_node.check_round_redeem_status()
+                    if cluster_dispatcher_instance:
+                        cluster_dispatcher_instance.next_run[target_node.index] = time.time()
+                    add_log(f"[RELOGIN DAEMON] ✅ Successfully revived {target_node.name}! Now Mining Active.")
+                else:
+                    add_log(f"[RELOGIN DAEMON] ⚠️ Relogin failed for {target_node.name}. Will retry later.")
+            except Exception as e:
+                add_log(f"[RELOGIN DAEMON] Error processing {target_node.name}: {e}")
+            finally:
+                with RELOGIN_LOCK:
+                    RELOGIN_QUEUED_SET.discard(target_node.index)
+                RELOGIN_QUEUE.task_done()
+                time.sleep(2)
+
+relogin_daemon_instance = None
 
 # ---------------- AUTO PINGER (KEEP ALIVE) ----------------
 class AutoPinger(threading.Thread):
@@ -1568,7 +1654,7 @@ engine_lock = threading.Lock()
 auto_pinger_instance = None
 
 def ensure_worker_engine_running():
-    global cluster_worker_pid, auto_pinger_instance, cluster_dispatcher_instance
+    global cluster_worker_pid, auto_pinger_instance, cluster_dispatcher_instance, relogin_daemon_instance
     current_pid = os.getpid()
 
     if PAUSE_MODE:
@@ -1591,6 +1677,8 @@ def ensure_worker_engine_running():
         initialize_cluster()
         cluster_dispatcher_instance = ClusterDispatcher(max_workers=8)
         cluster_dispatcher_instance.start()
+        relogin_daemon_instance = ReloginDaemon()
+        relogin_daemon_instance.start()
         auto_pinger_instance = AutoPinger()
         auto_pinger_instance.start()
 
@@ -1804,37 +1892,22 @@ def route_revive_cluster():
 
 @app.route('/api/relogin_dead_nodes', methods=['GET', 'POST'])
 def route_relogin_dead_nodes():
-    """Never-Die endpoint: Find all expired or dead @freediamond.in nodes and auto-relogin via OTP"""
-    dead_nodes = [
-        n for n in NODES
-        if '@freediamond.in' in n.email and (n.status != 'Mining Active' or not n.access_token or not n.jwt_exp or time.time() >= n.jwt_exp)
-    ]
-    
-    def relogin_runner():
-        add_log(f"[NEVER-DIE] Starting OTP relogin for {len(dead_nodes)} freediamond.in nodes...")
-        success = 0
-        failed = 0
-        for node in dead_nodes:
-            add_log(f"[NEVER-DIE] Relogging {node.name} ({node.email})...")
-            try:
-                if node.auto_relogin_via_otp():
-                    node.start_foreground_session()
-                    success += 1
-                else:
-                    failed += 1
-            except Exception as e:
-                add_log(f"[NEVER-DIE] Error relogging {node.name}: {e}")
-                failed += 1
-            # Stagger requests to avoid rate limiting
-            time.sleep(random.uniform(2.5, 4.0))
-        add_log(f"[NEVER-DIE] Batch relogin done! Success: {success} | Failed: {failed}")
-    
-    threading.Thread(target=relogin_runner, daemon=True).start()
-    return jsonify({
-        'success': True,
-        'dead_nodes_found': len(dead_nodes),
-        'message': f'OTP relogin initiated for {len(dead_nodes)} dead freediamond.in nodes!'
-    }), 200
+    """Never-Die endpoint: Find all dead/stalled @freediamond.in nodes and auto-relogin via OTP"""
+    with NODES_LOCK:
+        enqueued = 0
+        for n in NODES:
+            if '@freediamond.in' in n.email:
+                is_stalled = (
+                    '401' in n.status or 
+                    'Dead' in n.status or 
+                    'Expired' in n.status or 
+                    not n.access_token or
+                    (not n.session_id and n.balance == 0)
+                )
+                if is_stalled and n.status != 'Mining Active':
+                    if enqueue_for_relogin(n):
+                        enqueued += 1
+    return jsonify({'success': True, 'enqueued': enqueued, 'queue_size': RELOGIN_QUEUE.qsize()}), 200
 
 @app.route('/api/daily_checkin_all', methods=['GET', 'POST'])
 def route_daily_checkin_all():
