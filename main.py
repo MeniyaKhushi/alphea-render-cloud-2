@@ -39,6 +39,7 @@ CLUSTER_LOGS = []
 LOGS_LOCK = threading.Lock()
 NODES_LOCK = threading.Lock()
 OTP_LOCK = threading.Lock()
+SESSION_START_LOCK = threading.Lock()
 CLUSTER_STATE = {}
 NODES = []
 START_TIME = time.time()
@@ -580,7 +581,7 @@ class AccountWorker:
             self.update_cluster_state()
             return False
 
-    def authenticated_rpc(self, path, payload=None):
+    def authenticated_rpc(self, path, payload=None, timeout=25):
         if payload is None:
             payload = {}
 
@@ -597,12 +598,12 @@ class AccountWorker:
 
         for attempt in range(2):
             try:
-                r = self.session.post(url, headers=headers, json=payload, timeout=35)
+                r = self.session.post(url, headers=headers, json=payload, timeout=timeout)
                 if r.status_code == 401:
                     add_log(f"[{self.name}] 401 on {path.split('/')[-1]}, attempting refresh...")
                     if self.refresh_access_token():
                         headers['Authorization'] = f"Bearer {self.access_token}"
-                        r = self.session.post(url, headers=headers, json=payload, timeout=35)
+                        r = self.session.post(url, headers=headers, json=payload, timeout=timeout)
                     else:
                         self.status = '401 Session Dead (Re-login needed)'
                         self.update_cluster_state()
@@ -614,40 +615,85 @@ class AccountWorker:
                     self.location = "Direct Render VPS (Failover)"
                     continue
                 if attempt == 0:
-                    time.sleep(1.5)
+                    time.sleep(1.0)
                     continue
                 self.consecutive_errors += 1
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+                self.session = requests.Session()
                 return None
             except Exception as e:
                 if attempt == 0:
-                    time.sleep(1.5)
+                    time.sleep(1.0)
                     continue
                 self.consecutive_errors += 1
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+                self.session = requests.Session()
                 return None
 
     def start_foreground_session(self):
-        payload = {'deviceId': self.device_id, 'platform': 1}
-        r = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload)
-        if r and r.status_code == 200:
-            data = r.json()
-            self.session_id = data.get('sessionId')
-            self.consecutive_errors = 0
-            self.status = 'Mining Active'
-            self.update_cluster_state()
-            add_log(f"[{self.name}] Started Foreground Session: {self.session_id[:8]}...")
+        # 1. STRICT SAFETY GUARD: If already mining active with valid session ID, NEVER interrupt!
+        if self.session_id and self.status == 'Mining Active':
             return True
-        elif r and r.status_code == 401:
-            self.status = '401 Session Dead (Re-login needed)'
-        elif r and r.status_code in (500, 502, 503, 504):
-            self.status = f"⚠️ Server Busy ({r.status_code})"
-            add_log(f"[{self.name}] StartForegroundSession notice: HTTP {r.status_code}")
-        else:
-            err = r.text[:80] if r else 'Timeout (>35s)'
-            if not r:
-                self.status = '⚠️ Server Timeout (Retrying...)'
-            add_log(f"[{self.name}] StartForegroundSession notice: {err}")
-        self.update_cluster_state()
-        return False
+
+        # 2. Enforce serial rate-limited handshake to eliminate Alphea edge 503 & timeout bursts
+        with SESSION_START_LOCK:
+            # Re-check after acquiring lock in case another thread established it
+            if self.session_id and self.status == 'Mining Active':
+                return True
+
+            time.sleep(random.uniform(1.8, 3.2))
+            payload = {'deviceId': self.device_id, 'platform': 1}
+            r = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=20)
+            if r and r.status_code == 200:
+                data = r.json()
+                self.session_id = data.get('sessionId')
+                self.consecutive_errors = 0
+                self.status = 'Mining Active'
+                self.update_cluster_state()
+                add_log(f"[{self.name}] Started Foreground Session: {self.session_id[:8]}...")
+                return True
+            elif r and r.status_code == 401:
+                if self.refresh_token:
+                    if self.refresh_access_token():
+                        payload = {'deviceId': self.device_id, 'platform': 1}
+                        r2 = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=20)
+                        if r2 and r2.status_code == 200:
+                            data = r2.json()
+                            self.session_id = data.get('sessionId')
+                            self.consecutive_errors = 0
+                            self.status = 'Mining Active'
+                            self.update_cluster_state()
+                            add_log(f"[{self.name}] Started Foreground Session after token renewal: {self.session_id[:8]}...")
+                            return True
+                self.status = '401 Session Dead (Re-login needed)'
+            elif r and r.status_code in (500, 502, 503, 504):
+                self.status = f"⚠️ Server Busy ({r.status_code})"
+                self.consecutive_errors += 1
+                add_log(f"[{self.name}] StartForegroundSession notice: HTTP {r.status_code}")
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+                self.session = requests.Session()
+            else:
+                err = r.text[:80] if r else 'Timeout (>20s)'
+                self.consecutive_errors += 1
+                if not r:
+                    self.status = '⚠️ Server Timeout (Retrying...)'
+                    try:
+                        self.session.close()
+                    except Exception:
+                        pass
+                    self.session = requests.Session()
+                add_log(f"[{self.name}] StartForegroundSession notice: {err}")
+            self.update_cluster_state()
+            return False
 
     def get_effective_wallet(self):
         if self.pinned_wallet:
@@ -1119,14 +1165,14 @@ class AccountWorker:
         elif r and r.status_code in (500, 502, 503, 504):
             self.consecutive_errors += 1
             add_log(f"[{self.name}] Heartbeat server notice: HTTP {r.status_code} (Alphea server busy, retrying in 60s)")
-            if self.consecutive_errors > 8:
+            if self.consecutive_errors > 25:
                 self.session_id = None
             self.update_cluster_state()
             return False
         else:
-            err_msg = r.text[:60] if r else 'Network Timeout (>35s)'
+            err_msg = r.text[:60] if r else 'Network Timeout (>25s)'
             self.consecutive_errors += 1
-            if self.consecutive_errors > 8:
+            if self.consecutive_errors > 25:
                 self.session_id = None
             if self.consecutive_errors >= 2:
                 add_log(f"[{self.name}] Heartbeat notice: {err_msg} (Retry in 60s)")
@@ -1218,7 +1264,10 @@ class ClusterDispatcher(threading.Thread):
                     if now >= due_time:
                         due_nodes.append(node)
                         jitter = random.uniform(-1.0, 1.0)
-                        backoff = min(60, node.consecutive_errors * 10)
+                        if node.consecutive_errors > 0:
+                            backoff = min(180, node.consecutive_errors * 20) + random.uniform(5.0, 15.0)
+                        else:
+                            backoff = 0
                         self.next_run[node.index] = now + max(50, 60 + jitter + backoff)
 
             for node in due_nodes:
@@ -1731,23 +1780,27 @@ def route_update_account():
 @app.route('/api/revive_cluster', methods=['GET', 'POST'])
 def route_revive_cluster():
     def revive_runner():
-        add_log("[REVIVE] Cluster revival sequence started with safe human delay...")
-        nodes_copy = list(NODES)
-        for node in nodes_copy:
-            if not node.access_token or '@alphea.local' in node.email:
+        # STRICT SAFETY: ONLY revive nodes that are NOT currently Mining Active! Active nodes remain 100% untouched!
+        nodes_to_revive = [n for n in NODES if n.status != 'Mining Active' and n.access_token and '@alphea.local' not in n.email]
+        add_log(f"[REVIVE] Targeted revival started for {len(nodes_to_revive)} stalled/timed-out nodes (Active nodes completely untouched)...")
+        success = 0
+        for node in nodes_to_revive:
+            if node.status == 'Mining Active' and node.session_id:
                 continue
             try:
                 node.consecutive_errors = 0
-                node.session_uptime = 0
-                node.start_foreground_session()
-                node.fetch_and_claim_quests()
+                if node.jwt_exp and time.time() >= node.jwt_exp:
+                    node.refresh_access_token()
+                if node.start_foreground_session():
+                    node.fetch_and_claim_quests()
+                    success += 1
             except Exception as e:
                 add_log(f"[{node.name}] Revive error: {e}")
-            time.sleep(random.uniform(0.1, 0.2))
-        add_log("[REVIVE] Cluster revival sequence completed successfully!")
+            time.sleep(random.uniform(2.5, 4.0)) # Safe human delay
+        add_log(f"[REVIVE] Targeted revival complete! Successfully revived {success}/{len(nodes_to_revive)} nodes to Mining Active.")
 
     threading.Thread(target=revive_runner, daemon=True).start()
-    return jsonify({'success': True, 'message': 'Cluster 2 nodes revival cycle initiated with safe human delays!'}), 200
+    return jsonify({'success': True, 'message': 'Targeted node revival cycle initiated for stalled nodes with safe human delays!'}), 200
 
 @app.route('/api/relogin_dead_nodes', methods=['GET', 'POST'])
 def route_relogin_dead_nodes():
