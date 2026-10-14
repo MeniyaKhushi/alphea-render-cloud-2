@@ -1244,10 +1244,14 @@ class AccountWorker:
                     enqueue_for_relogin(self)
                 return
 
-        # 2. Check 401 / Dead / Relogin / Expired / Queued state - Token-First Safe Guard
-        if '401' in self.status or 'Dead' in self.status or 'Waiting for Sync' in self.status or 'Auto-Relogin' in self.status or 'Expired' in self.status or 'Queued' in self.status or (not self.session_id and self.balance == 0 and 'Timeout' in self.status):
-            # If already queued or in progress by ReloginDaemon, exit immediately so worker threads stay 100% free
-            if 'Auto-Relogin' in self.status or 'Queued' in self.status:
+        # 2. Token-First Guard: If JWT is still valid, unfreeze node to MINE immediately!
+        if self.jwt_exp and time.time() < (self.jwt_exp - 30):
+            if 'Queued' in self.status or 'Connecting' in self.status or 'Timeout' in self.status:
+                self.status = 'Mining Active'
+                self.update_cluster_state()
+        else:
+            # Token is actually expired or invalid:
+            if 'Auto-Relogin' in self.status:
                 return
             # First Priority: ALWAYS try silent refresh token first without requesting OTP!
             if self.refresh_token and 'Invalid' not in self.status:
@@ -1351,14 +1355,14 @@ class ReloginDaemon(threading.Thread):
                 with NODES_LOCK:
                     for n in NODES:
                         if '@freediamond.in' in n.email:
-                            is_dead = (
-                                '401' in n.status or 
-                                'Dead' in n.status or 
-                                'Expired' in n.status or 
-                                not n.access_token or
-                                (not n.session_id and n.balance == 0 and ('Timeout' in n.status or 'Connecting' in n.status))
+                            jwt_still_valid = n.jwt_exp and time.time() < (n.jwt_exp - 30)
+                            # ONLY truly dead if token is expired AND 401/Dead explicitly confirmed!
+                            is_truly_dead = (
+                                not jwt_still_valid and
+                                ('401' in n.status or 'Dead' in n.status or not n.access_token) and
+                                n.index not in RELOGIN_QUEUED_SET
                             )
-                            if is_dead and n.index not in RELOGIN_QUEUED_SET:
+                            if is_truly_dead:
                                 enqueue_for_relogin(n)
                                 break
                 time.sleep(2)
@@ -1369,7 +1373,7 @@ class ReloginDaemon(threading.Thread):
                 success = target_node.auto_relogin_via_otp()
                 if success:
                     if not target_node.session_id:
-                        target_node.start_foreground_session()
+                        target_node.start_foreground_session(force=True)
                     target_node.fetch_and_claim_quests()
                     target_node.check_round_redeem_status()
                     if cluster_dispatcher_instance:
