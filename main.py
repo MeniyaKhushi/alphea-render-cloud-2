@@ -714,16 +714,12 @@ class AccountWorker:
             else:
                 err = r.text[:80] if r else 'Timeout (>20s)'
                 self.consecutive_errors += 1
-                if not r:
-                    if '@freediamond.in' in self.email and not self.session_id and self.balance == 0:
-                        enqueue_for_relogin(self)
-                    else:
-                        self.status = '⚠️ Server Timeout (Retrying...)'
-                    try:
-                        self.session.close()
-                    except Exception:
-                        pass
-                    self.session = requests.Session()
+                self.status = '⚠️ Server Timeout (Retrying...)'
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
+                self.session = requests.Session()
                 add_log(f"[{self.name}] StartForegroundSession notice: {err}")
             self.update_cluster_state()
             return False
@@ -1369,6 +1365,27 @@ class ReloginDaemon(threading.Thread):
                 continue
 
             try:
+                # 1. Check if node already recovered or has valid token
+                if target_node.jwt_exp and time.time() < (target_node.jwt_exp - 30) and target_node.session_id:
+                    target_node.status = 'Mining Active'
+                    target_node.update_cluster_state()
+                    continue
+
+                # 2. Fast-Path Silent Refresh (0.5s instead of 60s OTP)
+                if target_node.refresh_token and 'Invalid' not in target_node.status:
+                    if target_node.refresh_access_token():
+                        if not target_node.session_id:
+                            target_node.start_foreground_session(force=True)
+                        target_node.fetch_and_claim_quests()
+                        target_node.check_round_redeem_status()
+                        target_node.status = 'Mining Active'
+                        target_node.update_cluster_state()
+                        if cluster_dispatcher_instance:
+                            cluster_dispatcher_instance.next_run[target_node.index] = time.time()
+                        add_log(f"[RELOGIN DAEMON] ⚡ Fast silent-refresh revived {target_node.name}! Now Mining Active.")
+                        continue
+
+                # 3. Only if token is truly rejected (401) or missing, run full OTP relogin
                 add_log(f"[RELOGIN DAEMON] Processing OTP auto-relogin for {target_node.name} ({target_node.email})...")
                 success = target_node.auto_relogin_via_otp()
                 if success:
