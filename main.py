@@ -673,7 +673,7 @@ class AccountWorker:
             if not force and self.session_id and self.status == 'Mining Active':
                 return True
 
-            time.sleep(random.uniform(1.8, 3.2))
+            time.sleep(random.uniform(0.15, 0.35))
             payload = {'deviceId': self.device_id, 'platform': 1}
             r = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=20)
             if r and r.status_code == 200:
@@ -1273,7 +1273,7 @@ class AccountWorker:
 
 # ---------------- CLUSTER DISPATCHER (WORKER POOL) ----------------
 class ClusterDispatcher(threading.Thread):
-    def __init__(self, max_workers=8):
+    def __init__(self, max_workers=35):
         super().__init__(name="ClusterDispatcher", daemon=True)
         self.max_workers = max_workers
         self.executor = concurrent.futures.ThreadPoolExecutor(
@@ -1314,16 +1314,19 @@ class ClusterDispatcher(threading.Thread):
 
             for node in due_nodes:
                 self.executor.submit(self._safe_tick, node)
-                if len(due_nodes) > 1:
-                    time.sleep(0.12)
 
             time.sleep(0.25)
 
     def _safe_tick(self, node):
+        if getattr(node, 'is_ticking', False):
+            return
+        node.is_ticking = True
         try:
             node.tick()
         except Exception as e:
             add_log(f"[{node.name}] Tick error: {e}")
+        finally:
+            node.is_ticking = False
 
 cluster_dispatcher_instance = None
 
