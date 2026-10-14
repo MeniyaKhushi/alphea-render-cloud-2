@@ -662,15 +662,15 @@ class AccountWorker:
                 self.session = requests.Session()
                 return None
 
-    def start_foreground_session(self):
-        # 1. STRICT SAFETY GUARD: If already mining active with valid session ID, NEVER interrupt!
-        if self.session_id and self.status == 'Mining Active':
+    def start_foreground_session(self, force=False):
+        # 1. STRICT SAFETY GUARD: If already mining active with valid session ID, NEVER interrupt unless forced!
+        if not force and self.session_id and self.status == 'Mining Active':
             return True
 
         # 2. Enforce serial rate-limited handshake to eliminate Alphea edge 503 & timeout bursts
         with SESSION_START_LOCK:
             # Re-check after acquiring lock in case another thread established it
-            if self.session_id and self.status == 'Mining Active':
+            if not force and self.session_id and self.status == 'Mining Active':
                 return True
 
             time.sleep(random.uniform(1.8, 3.2))
@@ -953,7 +953,8 @@ class AccountWorker:
                 self.session_uptime = 0
                 self.failed_claim_cache.clear()
                 add_log(f"[{self.name}] 🌅 Rolled over to new day ({pkey}). Renewing session for new day...")
-                self.start_foreground_session()
+                self.session_id = None
+                self.start_foreground_session(force=True)
 
             if qid == 'lifetime-welcome':
                 self.onboard_claimed = (state == 'QUEST_STATE_CLAIMED')
@@ -1158,7 +1159,7 @@ class AccountWorker:
 
     def submit_heartbeat(self):
         if not self.session_id:
-            if not self.start_foreground_session():
+            if not self.start_foreground_session(force=True):
                 return False
 
         payload = {'sessionId': self.session_id}
@@ -1180,7 +1181,8 @@ class AccountWorker:
             if self.session_uptime >= 86400:
                 add_log(f"[{self.name}] 🔄 24h Session Limit reached (86,400s). Renewing foreground session...")
                 self.session_uptime = 0
-                self.start_foreground_session()
+                self.session_id = None
+                self.start_foreground_session(force=True)
 
             # Autonomous Milestone-Driven Auto Quest Claim Engine on Heartbeat:
             milestones = [3600, 10800, 21600, 43200]
@@ -1191,10 +1193,21 @@ class AccountWorker:
                 self.check_round_redeem_status()
 
             return True
-        elif r and r.status_code == 400 and 'connect foreground session not active' in r.text:
-            add_log(f"[{self.name}] Foreground session expired, renewing session ID...")
-            self.start_foreground_session()
-            return False
+        elif r and r.status_code == 400:
+            err_text = r.text.lower()
+            if any(k in err_text for k in ['not active', 'activity slot', 'failed_precondition', 'expired', 'invalid session', 'not found', 'foreground session']):
+                add_log(f"[{self.name}] Foreground session expired on server ({r.text[:55]}). Auto-renewing session handshake...")
+                self.session_id = None
+                self.start_foreground_session(force=True)
+                return False
+            else:
+                self.consecutive_errors += 1
+                add_log(f"[{self.name}] Heartbeat 400 notice: {r.text[:60]}")
+                if self.consecutive_errors >= 3:
+                    self.session_id = None
+                    self.start_foreground_session(force=True)
+                self.update_cluster_state()
+                return False
         elif r and r.status_code in (500, 502, 503, 504):
             self.consecutive_errors += 1
             add_log(f"[{self.name}] Heartbeat server notice: HTTP {r.status_code} (Alphea server busy, retrying in 60s)")
@@ -1239,7 +1252,7 @@ class AccountWorker:
             # First Priority: ALWAYS try silent refresh token first without requesting OTP!
             if self.refresh_token and 'Invalid' not in self.status:
                 if self.refresh_access_token():
-                    self.start_foreground_session()
+                    self.start_foreground_session(force=True)
                     return
             # Second Priority: Enqueue to background Never-Die Relogin Daemon
             if '@freediamond.in' in self.email:
@@ -1248,7 +1261,7 @@ class AccountWorker:
 
         # 3. Ensure foreground session is active
         if not self.session_id:
-            if not self.start_foreground_session():
+            if not self.start_foreground_session(force=True):
                 return
 
         # 4. Submit heartbeat (advances mining time & auto-claims completed quests on milestone)
@@ -1868,18 +1881,19 @@ def route_update_account():
 @app.route('/api/revive_cluster', methods=['GET', 'POST'])
 def route_revive_cluster():
     def revive_runner():
-        # STRICT SAFETY: ONLY revive nodes that are NOT currently Mining Active! Active nodes remain 100% untouched!
-        nodes_to_revive = [n for n in NODES if n.status != 'Mining Active' and n.access_token and '@alphea.local' not in n.email]
-        add_log(f"[REVIVE] Targeted revival started for {len(nodes_to_revive)} stalled/timed-out nodes (Active nodes completely untouched)...")
+        # STRICT SAFETY: ONLY revive nodes that are NOT advancing mining time (stalled 0 uptime) or inactive! Active nodes advancing uptime remain 100% untouched!
+        nodes_to_revive = [n for n in NODES if (n.status != 'Mining Active' or n.session_uptime == 0 or not n.session_id) and n.access_token and '@alphea.local' not in n.email]
+        add_log(f"[REVIVE] Targeted revival started for {len(nodes_to_revive)} stalled/timed-out nodes (Active advancing nodes completely untouched)...")
         success = 0
         for node in nodes_to_revive:
-            if node.status == 'Mining Active' and node.session_id:
+            # Re-check status before acting: If actively mining and uptime > 0, NEVER interrupt!
+            if node.status == 'Mining Active' and node.session_id and node.session_uptime > 0:
                 continue
             try:
                 node.consecutive_errors = 0
                 if node.jwt_exp and time.time() >= node.jwt_exp:
                     node.refresh_access_token()
-                if node.start_foreground_session():
+                if node.start_foreground_session(force=True):
                     node.fetch_and_claim_quests()
                     success += 1
             except Exception as e:
