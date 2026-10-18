@@ -900,27 +900,102 @@ class AccountWorker:
             return {'success': False, 'message': f'RPC Error: {err}'}
 
     def check_and_claim_sponsored_rewards(self):
-        """Stage 2: Auto-claim token payouts from closed rounds via sponsored gas."""
+        """Auto-claim token payouts from closed rounds via sponsored gas with full queue & failed reset support."""
         try:
             r = self.authenticated_rpc('alphea.connect.v1.RewardService/GetClaimableRewards', {})
-            if r and r.status_code == 200:
-                data = r.json()
-                rewards = data.get('rewards', [])
-                for rew in rewards:
-                    rid = rew.get('roundId') or rew.get('round_id')
-                    claimable = rew.get('claimable', False)
-                    claimed = rew.get('claimed', False)
-                    if rid and claimable and not claimed:
-                        add_log(f"[{self.name}] 🏆 Claimable token reward found for round {rid}! Submitting sponsored claim...")
-                        claim_payload = {
-                            'roundId': rid,
-                            'idempotencyKey': str(uuid.uuid4())
-                        }
-                        cr = self.authenticated_rpc('alphea.connect.v1.RewardService/SubmitSponsoredClaim', claim_payload)
-                        if cr and cr.status_code == 200:
-                            add_log(f"[{self.name}] 🚀 Sponsored Claim Submitted successfully for round {rid}!")
-        except Exception:
-            pass
+            if not r or r.status_code != 200:
+                return False
+
+            data = r.json()
+            rewards = data.get('rewards', [])
+            if not rewards:
+                return False
+
+            for rew in rewards:
+                rid = rew.get('roundId') or rew.get('round_id')
+                claimable = rew.get('claimable', False)
+                claimed = rew.get('claimed', False)
+                title = rew.get('roundTitle') or rew.get('title') or (str(rid)[:8] if rid else 'Round')
+
+                if not rid or not claimable or claimed:
+                    continue
+
+                add_log(f"[{self.name}] 🏆 Claimable reward found for {title} (Round: {rid})")
+
+                # Step 1: Check existing operation status for this round
+                op_id = None
+                reset_gen = '0'
+                needs_reset = False
+
+                try:
+                    op_res = self.authenticated_rpc('alphea.connect.v1.RewardService/GetSponsoredClaimOperationByRound', {'roundId': rid})
+                    if op_res and op_res.status_code == 200:
+                        op_data = op_res.json()
+                        op_id = op_data.get('operationId') or (op_data.get('operation', {})).get('operationId')
+
+                    if op_id:
+                        st_res = self.authenticated_rpc('alphea.connect.v1.RewardService/GetSponsoredClaimStatus', {'operationId': op_id})
+                        if st_res and st_res.status_code == 200:
+                            st_data = st_res.json()
+                            state = st_data.get('state', '')
+                            reset_gen = st_data.get('resetGeneration', '0')
+                            add_log(f"[{self.name}] Round {title} existing operation {op_id[:8]}... state: {state}")
+
+                            if state == 'SPONSORED_CLAIM_STATE_SUCCEEDED':
+                                add_log(f"[{self.name}] Round {title} already succeeded on-chain!")
+                                continue
+                            elif state in ('SPONSORED_CLAIM_STATE_FAILED', 'SPONSORED_CLAIM_STATE_UNSPECIFIED', 'SPONSORED_CLAIM_STATE_UNKNOWN'):
+                                needs_reset = True
+                                add_log(f"[{self.name}] ⚠️ Round {title} previously failed on-chain. Triggering 'Claim again' reset...")
+                            elif state in ('SPONSORED_CLAIM_STATE_PENDING', 'SPONSORED_CLAIM_STATE_PROCESSING'):
+                                add_log(f"[{self.name}] Round {title} is currently processing on-chain. Awaiting relayer confirmation.")
+                                continue
+                except Exception as op_err:
+                    add_log(f"[{self.name}] Op check error: {op_err}")
+
+                # Step 2: Queue Entrance (Join line if queue enabled)
+                try:
+                    q_res = self.authenticated_rpc('alphea.connect.v1.RewardService/JoinSponsoredClaimQueue', {'roundId': rid})
+                    if q_res and q_res.status_code == 200:
+                        q_data = q_res.json()
+                        q_state = q_data.get('queueState')
+                        refusal = q_data.get('refusal')
+
+                        if refusal == 'SPONSORED_CLAIM_QUEUE_REFUSAL_QUEUE_UNAVAILABLE':
+                            # No queue required, immediately admitted
+                            pass
+                        elif q_state != 'SPONSORED_CLAIM_QUEUE_STATE_ADMITTED':
+                            # Poll queue up to 3 times if in line
+                            for _ in range(3):
+                                time.sleep(2.0)
+                                q_poll = self.authenticated_rpc('alphea.connect.v1.RewardService/GetSponsoredClaimQueueStatus', {'roundId': rid})
+                                if q_poll and q_poll.status_code == 200:
+                                    qp_data = q_poll.json()
+                                    if qp_data.get('queueState') == 'SPONSORED_CLAIM_QUEUE_STATE_ADMITTED' or qp_data.get('refusal') == 'SPONSORED_CLAIM_QUEUE_REFUSAL_QUEUE_UNAVAILABLE':
+                                        break
+                except Exception as q_err:
+                    add_log(f"[{self.name}] Queue notice: {q_err}")
+
+                # Step 3: Submit Sponsored Claim (with resetOperationId if failed previously)
+                claim_payload = {
+                    'roundId': rid,
+                    'idempotencyKey': str(uuid.uuid4())
+                }
+                if needs_reset and op_id:
+                    claim_payload['resetOperationId'] = op_id
+                    claim_payload['resetGeneration'] = str(reset_gen)
+
+                cr = self.authenticated_rpc('alphea.connect.v1.RewardService/SubmitSponsoredClaim', claim_payload)
+                if cr and cr.status_code == 200:
+                    res_json = cr.json()
+                    new_op_id = res_json.get('operationId') or (res_json.get('operation', {})).get('operationId') or 'ok'
+                    add_log(f"[{self.name}] 🚀 Sponsored Claim Submitted successfully for {title}! (Op: {str(new_op_id)[:8]}...)")
+                else:
+                    err_msg = cr.text[:100] if cr else 'Timeout'
+                    add_log(f"[{self.name}] ❌ Sponsored Claim Submission failed for {title}: {err_msg}")
+
+        except Exception as e:
+            add_log(f"[{self.name}] Sponsored claim error: {e}")
 
     def fetch_and_claim_quests(self):
         # 1. Trigger authenticated login session on Alphea backend (fulfills QUEST_METRIC_AUTHENTICATED_LOGIN_COUNT)
