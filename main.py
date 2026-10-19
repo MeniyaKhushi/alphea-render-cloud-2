@@ -1483,6 +1483,7 @@ class ReloginDaemon(threading.Thread):
                             target_node.start_foreground_session(force=True)
                         target_node.fetch_and_claim_quests()
                         target_node.check_round_redeem_status()
+                        threading.Thread(target=target_node.check_and_claim_sponsored_rewards, kwargs={'max_wait_seconds': 360}, daemon=True).start()
                         target_node.status = 'Mining Active'
                         target_node.update_cluster_state()
                         if cluster_dispatcher_instance:
@@ -1498,6 +1499,7 @@ class ReloginDaemon(threading.Thread):
                         target_node.start_foreground_session(force=True)
                     target_node.fetch_and_claim_quests()
                     target_node.check_round_redeem_status()
+                    threading.Thread(target=target_node.check_and_claim_sponsored_rewards, kwargs={'max_wait_seconds': 360}, daemon=True).start()
                     if cluster_dispatcher_instance:
                         cluster_dispatcher_instance.next_run[target_node.index] = time.time()
                     add_log(f"[RELOGIN DAEMON] ✅ Successfully revived {target_node.name}! Now Mining Active.")
@@ -1512,6 +1514,47 @@ class ReloginDaemon(threading.Thread):
                 time.sleep(2)
 
 relogin_daemon_instance = None
+
+# ---------------- CONTINUOUS AUTOPILOT CLAIM DAEMON ----------------
+class ContinuousClaimDaemon(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.last_run_time = 0
+
+    def run(self):
+        if PAUSE_MODE:
+            return
+        # Initial 45s delay to let cluster workers initialize
+        time.sleep(45)
+        add_log("[AUTOPILOT CLAIM] 24/7 Autopilot Claim Engine activated! Periodic sweeps every 15m.")
+        while True:
+            try:
+                now = time.time()
+                # Run every 15 minutes (900 seconds)
+                if (now - self.last_run_time) >= 900:
+                    self.last_run_time = now
+                    eligible_nodes = [
+                        node for node in list(NODES)
+                        if node.access_token and '@alphea.local' not in node.email and '401' not in node.status and 'Dead' not in node.status and 'Expired' not in node.status
+                    ]
+                    if eligible_nodes:
+                        add_log(f"[AUTOPILOT CLAIM] 🚀 Starting 15m parallel sweep for {len(eligible_nodes)} active nodes (10 concurrent workers)...")
+                        def claim_task(n):
+                            try:
+                                return n.check_and_claim_sponsored_rewards(max_wait_seconds=360)
+                            except Exception:
+                                return False
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                            futures = [executor.submit(claim_task, n) for n in eligible_nodes]
+                            for f in concurrent.futures.as_completed(futures):
+                                pass
+                        add_log(f"[AUTOPILOT CLAIM] ✅ Sweep cycle completed at {get_ist_now_str()}!")
+            except Exception as e:
+                add_log(f"[AUTOPILOT CLAIM] Error: {e}")
+            time.sleep(30)
+
+continuous_claim_daemon_instance = None
 
 # ---------------- AUTO PINGER (KEEP ALIVE) ----------------
 class AutoPinger(threading.Thread):
@@ -1796,7 +1839,7 @@ engine_lock = threading.Lock()
 auto_pinger_instance = None
 
 def ensure_worker_engine_running():
-    global cluster_worker_pid, auto_pinger_instance, cluster_dispatcher_instance, relogin_daemon_instance
+    global cluster_worker_pid, auto_pinger_instance, cluster_dispatcher_instance, relogin_daemon_instance, continuous_claim_daemon_instance
     current_pid = os.getpid()
 
     if PAUSE_MODE:
@@ -1821,6 +1864,8 @@ def ensure_worker_engine_running():
         cluster_dispatcher_instance.start()
         relogin_daemon_instance = ReloginDaemon()
         relogin_daemon_instance.start()
+        continuous_claim_daemon_instance = ContinuousClaimDaemon()
+        continuous_claim_daemon_instance.start()
         auto_pinger_instance = AutoPinger()
         auto_pinger_instance.start()
 
