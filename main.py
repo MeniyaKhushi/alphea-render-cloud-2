@@ -899,7 +899,7 @@ class AccountWorker:
             add_log(f"[{self.name}] Redeem error: {err}")
             return {'success': False, 'message': f'RPC Error: {err}'}
 
-    def check_and_claim_sponsored_rewards(self):
+    def check_and_claim_sponsored_rewards(self, max_wait_seconds=300):
         """Auto-claim token payouts from closed rounds via sponsored gas with full queue & failed reset support."""
         try:
             r = self.authenticated_rpc('alphea.connect.v1.RewardService/GetClaimableRewards', {})
@@ -917,10 +917,8 @@ class AccountWorker:
                 claimed = rew.get('claimed', False)
                 title = rew.get('roundTitle') or rew.get('title') or (str(rid)[:8] if rid else 'Round')
 
-                if not rid or not claimable or claimed:
+                if not rid or claimed:
                     continue
-
-                add_log(f"[{self.name}] 🏆 Claimable reward found for {title} (Round: {rid})")
 
                 # Step 1: Check existing operation status for this round
                 op_id = None
@@ -939,44 +937,69 @@ class AccountWorker:
                             st_data = st_res.json()
                             state = st_data.get('state', '')
                             reset_gen = st_data.get('resetGeneration', '0')
-                            add_log(f"[{self.name}] Round {title} existing operation {op_id[:8]}... state: {state}")
+                            tx_hash = st_data.get('transactionHash', '')
 
-                            if state == 'SPONSORED_CLAIM_STATE_SUCCEEDED':
-                                add_log(f"[{self.name}] Round {title} already succeeded on-chain!")
+                            if state in ('SPONSORED_CLAIM_STATE_SUCCEEDED', 'SPONSORED_CLAIM_STATE_CORE_CONFIRMED'):
+                                add_log(f"[{self.name}] 🏆 Round {title} already confirmed on-chain! Tx: {tx_hash[:10]}...")
                                 continue
-                            elif state in ('SPONSORED_CLAIM_STATE_FAILED', 'SPONSORED_CLAIM_STATE_UNSPECIFIED', 'SPONSORED_CLAIM_STATE_UNKNOWN'):
+                            elif state in ('SPONSORED_CLAIM_STATE_ACCEPTED_FOR_RELAY', 'SPONSORED_CLAIM_STATE_SUBMITTED', 'SPONSORED_CLAIM_STATE_PENDING', 'SPONSORED_CLAIM_STATE_PROCESSING'):
+                                add_log(f"[{self.name}] ⏳ Round {title} currently relaying on-chain ({state}). Awaiting confirmation.")
+                                continue
+                            elif state in ('SPONSORED_CLAIM_STATE_FAILED', 'SPONSORED_CLAIM_STATE_UNSPECIFIED', 'SPONSORED_CLAIM_STATE_UNKNOWN', 'SPONSORED_CLAIM_STATE_REFUSED'):
                                 needs_reset = True
-                                add_log(f"[{self.name}] ⚠️ Round {title} previously failed on-chain. Triggering 'Claim again' reset...")
-                            elif state in ('SPONSORED_CLAIM_STATE_PENDING', 'SPONSORED_CLAIM_STATE_PROCESSING'):
-                                add_log(f"[{self.name}] Round {title} is currently processing on-chain. Awaiting relayer confirmation.")
-                                continue
+                                add_log(f"[{self.name}] ⚠️ Round {title} previously failed/refused ({state}). Rejoining queue to re-claim...")
                 except Exception as op_err:
-                    add_log(f"[{self.name}] Op check error: {op_err}")
+                    add_log(f"[{self.name}] Op check notice: {op_err}")
 
-                # Step 2: Queue Entrance (Join line if queue enabled)
+                # Step 2: Queue Entrance & Waiting Room Loop
+                admitted = False
                 try:
-                    q_res = self.authenticated_rpc('alphea.connect.v1.RewardService/JoinSponsoredClaimQueue', {'roundId': rid})
-                    if q_res and q_res.status_code == 200:
-                        q_data = q_res.json()
-                        q_state = q_data.get('queueState')
-                        refusal = q_data.get('refusal')
+                    q_chk = self.authenticated_rpc('alphea.connect.v1.RewardService/GetSponsoredClaimQueueStatus', {'roundId': rid})
+                    if q_chk and q_chk.status_code == 200:
+                        curr_q_data = q_chk.json()
+                        if curr_q_data.get('state') == 'SPONSORED_CLAIM_QUEUE_STATE_ADMITTED':
+                            admitted = True
 
-                        if refusal == 'SPONSORED_CLAIM_QUEUE_REFUSAL_QUEUE_UNAVAILABLE':
-                            # No queue required, immediately admitted
-                            pass
-                        elif q_state != 'SPONSORED_CLAIM_QUEUE_STATE_ADMITTED':
-                            # Poll queue up to 3 times if in line
-                            for _ in range(3):
-                                time.sleep(2.0)
-                                q_poll = self.authenticated_rpc('alphea.connect.v1.RewardService/GetSponsoredClaimQueueStatus', {'roundId': rid})
-                                if q_poll and q_poll.status_code == 200:
-                                    qp_data = q_poll.json()
-                                    if qp_data.get('queueState') == 'SPONSORED_CLAIM_QUEUE_STATE_ADMITTED' or qp_data.get('refusal') == 'SPONSORED_CLAIM_QUEUE_REFUSAL_QUEUE_UNAVAILABLE':
-                                        break
+                    if not admitted:
+                        q_res = self.authenticated_rpc('alphea.connect.v1.RewardService/JoinSponsoredClaimQueue', {'roundId': rid})
+                        if q_res and q_res.status_code == 200:
+                            q_data = q_res.json()
+                            q_state = q_data.get('state', '')
+                            refusal = q_data.get('refusal', '')
+                            users_ahead = q_data.get('approximateUsersAhead', '0')
+
+                            if refusal == 'SPONSORED_CLAIM_QUEUE_REFUSAL_QUEUE_UNAVAILABLE':
+                                admitted = True
+                            elif q_state == 'SPONSORED_CLAIM_QUEUE_STATE_ADMITTED':
+                                admitted = True
+                            else:
+                                add_log(f"[{self.name}] ⏳ Waiting in queue for Round {title} (~{users_ahead} users ahead)...")
+                                q_start = time.time()
+                                while time.time() - q_start < max_wait_seconds:
+                                    poll_interval = 4.0
+                                    q_poll = self.authenticated_rpc('alphea.connect.v1.RewardService/GetSponsoredClaimQueueStatus', {'roundId': rid})
+                                    if q_poll and q_poll.status_code == 200:
+                                        qp_data = q_poll.json()
+                                        qp_state = qp_data.get('state', '')
+                                        qp_refusal = qp_data.get('refusal', '')
+                                        poll_ms = qp_data.get('pollAfterMilliseconds', 4000)
+                                        if poll_ms:
+                                            poll_interval = max(2.5, poll_ms / 1000.0)
+
+                                        if qp_state == 'SPONSORED_CLAIM_QUEUE_STATE_ADMITTED' or qp_refusal == 'SPONSORED_CLAIM_QUEUE_REFUSAL_QUEUE_UNAVAILABLE':
+                                            admitted = True
+                                            break
+                                        elif qp_state in ('SPONSORED_CLAIM_QUEUE_STATE_EXPIRED', 'SPONSORED_CLAIM_QUEUE_STATE_CONSUMED', 'SPONSORED_CLAIM_QUEUE_STATE_LEFT'):
+                                            self.authenticated_rpc('alphea.connect.v1.RewardService/JoinSponsoredClaimQueue', {'roundId': rid})
+                                    time.sleep(poll_interval)
                 except Exception as q_err:
-                    add_log(f"[{self.name}] Queue notice: {q_err}")
+                    add_log(f"[{self.name}] Queue error: {q_err}")
 
-                # Step 3: Submit Sponsored Claim (with resetOperationId if failed previously)
+                if not admitted:
+                    add_log(f"[{self.name}] ⚠️ Queue wait timed out for Round {title}. Will retry on next cycle.")
+                    continue
+
+                # Step 3: Submit Sponsored Claim (with reset params if re-claiming)
                 claim_payload = {
                     'roundId': rid,
                     'idempotencyKey': str(uuid.uuid4())
@@ -988,12 +1011,19 @@ class AccountWorker:
                 cr = self.authenticated_rpc('alphea.connect.v1.RewardService/SubmitSponsoredClaim', claim_payload)
                 if cr and cr.status_code == 200:
                     res_json = cr.json()
-                    new_op_id = res_json.get('operationId') or (res_json.get('operation', {})).get('operationId') or 'ok'
-                    add_log(f"[{self.name}] 🚀 Sponsored Claim Submitted successfully for {title}! (Op: {str(new_op_id)[:8]}...)")
+                    submit_state = res_json.get('state', '')
+                    submit_refusal = res_json.get('refusal', '')
+                    new_op_id = res_json.get('operationId') or op_id or 'ok'
+
+                    if submit_state == 'SPONSORED_CLAIM_STATE_REFUSED':
+                        add_log(f"[{self.name}] ⚠️ Claim refused for {title}: {submit_refusal}. Will re-enter queue next run.")
+                    elif submit_state in ('SPONSORED_CLAIM_STATE_ACCEPTED_FOR_RELAY', 'SPONSORED_CLAIM_STATE_SUBMITTED', 'SPONSORED_CLAIM_STATE_MINED', 'SPONSORED_CLAIM_STATE_CORE_CONFIRMED'):
+                        add_log(f"[{self.name}] 🚀 Claim Accepted for On-Chain Relay! ({title}, Op: {str(new_op_id)[:8]}...)")
+                    else:
+                        add_log(f"[{self.name}] ℹ️ Claim result for {title}: {submit_state}")
                 else:
                     err_msg = cr.text[:100] if cr else 'Timeout'
-                    add_log(f"[{self.name}] ❌ Sponsored Claim Submission failed for {title}: {err_msg}")
-
+                    add_log(f"[{self.name}] ❌ Claim Submission failed for {title}: {err_msg}")
         except Exception as e:
             add_log(f"[{self.name}] Sponsored claim error: {e}")
 
@@ -2166,21 +2196,32 @@ def route_claim_all():
         IS_CLAIM_RUNNING = True
     LAST_CLAIM_ALL_TIME = get_ist_now_str()
     save_timestamps()
+
+    def claim_worker_task(node):
+        try:
+            return node.check_and_claim_sponsored_rewards(max_wait_seconds=360)
+        except Exception as e:
+            add_log(f"[{node.name}] Claim sweep error: {e}")
+            return False
+
     def claim_runner():
         global IS_CLAIM_RUNNING
         try:
-            add_log(f"[CLAIM ALL] Global 1-Click Sponsored Claim sweep started at {LAST_CLAIM_ALL_TIME}...")
-            nodes_copy = list(NODES)
-            skipped_cnt = 0
-            for node in nodes_copy:
-                if not node.access_token or '@alphea.local' in node.email or '401' in node.status or 'Dead' in node.status or 'Expired' in node.status:
-                    skipped_cnt += 1
-                    continue
-                try:
-                    node.check_and_claim_sponsored_rewards()
-                except Exception as e:
-                    add_log(f"[{node.name}] Claim sweep error: {e}")
-                time.sleep(random.uniform(0.8, 1.5))
+            add_log(f"[CLAIM ALL] Global High-Speed Sponsored Claim sweep started at {LAST_CLAIM_ALL_TIME}...")
+            eligible_nodes = [
+                node for node in list(NODES)
+                if node.access_token and '@alphea.local' not in node.email and '401' not in node.status and 'Dead' not in node.status and 'Expired' not in node.status
+            ]
+            add_log(f"[CLAIM ALL] {len(eligible_nodes)} active nodes entered parallel claim sweep (10 concurrent workers)...")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {executor.submit(claim_worker_task, node): node for node in eligible_nodes}
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as fe:
+                        pass
+
             add_log(f"[CLAIM ALL] Sponsored Claim sweep completed at {get_ist_now_str()}!")
         finally:
             with SWEEP_LOCK:
@@ -2189,7 +2230,7 @@ def route_claim_all():
     threading.Thread(target=claim_runner, daemon=True).start()
     return jsonify({
         'success': True,
-        'message': f'Global Sponsored Claim sweep initiated ({LAST_CLAIM_ALL_TIME})!'
+        'message': f'Global High-Speed Sponsored Claim sweep initiated ({LAST_CLAIM_ALL_TIME})!'
     }), 200
 
 # ---------------- INITIALIZATION ----------------
