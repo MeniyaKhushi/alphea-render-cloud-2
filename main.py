@@ -712,9 +712,13 @@ class AccountWorker:
                     self.status = '401 Session Dead (Re-login needed)'
                     self.update_cluster_state()
             elif r and r.status_code in (500, 502, 503, 504):
-                self.status = f"⚠️ Server Busy ({r.status_code})"
+                if r.status_code == 503 and 'activity' in r.text.lower():
+                    self.round_status = 'ROUND_STATUS_CLOSING'
+                    self.status = 'Standby (Round Closing)'
+                else:
+                    self.status = f"⚠️ Server Busy ({r.status_code})"
                 self.consecutive_errors = min(self.consecutive_errors + 1, 3)
-                add_log(f"[{self.name}] StartForegroundSession notice: HTTP {r.status_code}")
+                add_log(f"[{self.name}] StartForegroundSession notice: HTTP {r.status_code} ({r.text[:50]})")
                 try:
                     self.session.close()
                 except Exception:
@@ -723,7 +727,11 @@ class AccountWorker:
             else:
                 err = r.text[:80] if r else 'Timeout (>8s)'
                 self.consecutive_errors = min(self.consecutive_errors + 1, 3)
-                self.status = '⚠️ Server Timeout (Retrying...)'
+                round_st = getattr(self, 'round_status', '')
+                if 'CLOSING' in round_st or 'CLOSED' in round_st:
+                    self.status = 'Standby (Round Closing)'
+                else:
+                    self.status = '⚠️ Server Timeout (Retrying...)'
                 try:
                     self.session.close()
                 except Exception:
@@ -760,13 +768,15 @@ class AccountWorker:
         return self.check_round_redeem_status()
 
     def check_round_redeem_status(self):
-        # Query official wallet point balance to ensure 100% sync with hub.alphea.ai
+        # 1. Query official wallet point balance (Primary source of truth for total balance)
+        official_pts = 0
         try:
             r_pts = self.authenticated_rpc('alphea.connect.v1.WalletService/GetPointBalance', {})
             if r_pts and r_pts.status_code == 200:
                 pts_data = r_pts.json()
                 bal_pts = int(pts_data.get('balance', {}).get('micros', '0')) // 1000000
                 if bal_pts > 0:
+                    official_pts = bal_pts
                     self.balance = bal_pts
         except Exception:
             pass
@@ -776,10 +786,16 @@ class AccountWorker:
             data = r.json()
             balance_micros = int(data.get('balance', {}).get('micros', '0'))
             bal = balance_micros // 1000000
-            self.balance = bal
-            self.cached_balance = bal
+
+            # Keep official balance if available, otherwise fallback to round balance
+            if official_pts > 0:
+                self.balance = official_pts
+            elif bal > 0:
+                self.balance = bal
+            self.cached_balance = self.balance
 
             self.round_id = data.get('roundId', '')
+            self.round_status = data.get('status', '')
             self.cached_round_id = self.round_id
             self.pinned_wallet = data.get('pinnedWalletAddress', '')
             self.can_redeem = data.get('canRedeem', False)
@@ -798,32 +814,32 @@ class AccountWorker:
                 self.redeem_claimed = True
                 self.can_redeem = False
             elif not self.pinned_wallet or blocked_reason == 'REDEEM_BLOCKED_REASON_NO_ACTIVE_WALLET':
-                if bal > 0:
+                if self.balance > 0:
                     self.redeem_status_text = "⚠️ No Active Wallet"
                 else:
                     self.redeem_status_text = "0 Pts (Standby)"
                 self.redeem_claimed = False
                 self.can_redeem = False
-            elif bal > 0 and bal < min_pts:
-                self.redeem_status_text = f"⏳ Min {min_pts:,} Pts Req ({bal:,}/{min_pts:,})"
+            elif self.balance > 0 and self.balance < min_pts:
+                self.redeem_status_text = f"⏳ Min {min_pts:,} Pts Req ({self.balance:,}/{min_pts:,})"
                 self.redeem_claimed = False
                 self.can_redeem = False
-            elif self.can_redeem and bal >= min_pts and self.pinned_wallet and blocked_reason not in ['REDEEM_BLOCKED_REASON_ROUND_CLOSED', 'REDEEM_BLOCKED_REASON_CAP_REACHED']:
-                self.redeem_status_text = f"⏳ Claimable ({bal:,} Pts)"
+            elif self.can_redeem and self.balance >= min_pts and self.pinned_wallet and blocked_reason not in ['REDEEM_BLOCKED_REASON_ROUND_CLOSED', 'REDEEM_BLOCKED_REASON_CAP_REACHED']:
+                self.redeem_status_text = f"⏳ Claimable ({self.balance:,} Pts)"
                 self.redeem_claimed = False
                 self.can_redeem = True
             elif blocked_reason == 'REDEEM_BLOCKED_REASON_CAP_REACHED':
                 self.redeem_status_text = "✅ Cap Reached"
                 self.redeem_claimed = True
                 self.can_redeem = False
-            elif blocked_reason == 'REDEEM_BLOCKED_REASON_ROUND_CLOSED':
-                if bal > 0:
-                    self.redeem_status_text = f"🔒 Round Closed ({bal:,} Pts)"
+            elif blocked_reason == 'REDEEM_BLOCKED_REASON_ROUND_CLOSED' or self.round_status in ['ROUND_STATUS_CLOSING', 'ROUND_STATUS_CLOSED']:
+                if self.balance > 0:
+                    self.redeem_status_text = f"🔒 Round Closing ({self.balance:,} Pts)"
                 else:
-                    self.redeem_status_text = "🔒 Round Closed"
+                    self.redeem_status_text = "🔒 Round Closing"
                 self.redeem_claimed = False
                 self.can_redeem = False
-            elif bal == 0 and accepted_points == 0:
+            elif self.balance == 0 and accepted_points == 0:
                 self.redeem_status_text = "0 Pts (Standby)"
                 self.redeem_claimed = False
                 self.can_redeem = False
@@ -1349,46 +1365,75 @@ class AccountWorker:
             self.update_cluster_state()
             return
 
-        # 1. PRIORITY FAST-PATH: If already Mining Active with valid session and unexpired JWT, submit heartbeat immediately!
-        if self.session_id and self.status == 'Mining Active' and self.jwt_exp and time.time() < (self.jwt_exp - 30):
-            self.tick_count = getattr(self, 'tick_count', 0) + 1
-            self.submit_heartbeat()
-            return
+        now = time.time()
 
-        # 2. Proactive JWT renewal (2 min before exp) - Silent Refresh Token Only
-        if self.jwt_exp and time.time() > (self.jwt_exp - 120):
+        # 1. Proactive JWT renewal (2 min before exp) - Silent Refresh Token Only
+        if self.jwt_exp and now > (self.jwt_exp - 120):
             if not self.refresh_access_token():
                 if '@freediamond.in' in self.email:
                     enqueue_for_relogin(self)
                 return
 
-        # 3. Token-First Guard: If JWT is still valid, unfreeze node to MINE immediately!
-        if self.jwt_exp and time.time() < (self.jwt_exp - 30):
-            if 'Queued' in self.status or 'Connecting' in self.status or 'Timeout' in self.status:
-                self.status = 'Mining Active'
-                self.update_cluster_state()
-        else:
-            # Token is actually expired or invalid:
+        # 2. Token Validity Guard
+        if not self.jwt_exp or now >= (self.jwt_exp - 30):
             if 'Auto-Relogin' in self.status:
                 return
-            # First Priority: ALWAYS try silent refresh token first without requesting OTP!
             if self.refresh_token and 'Invalid' not in self.status:
                 if self.refresh_access_token():
-                    self.start_foreground_session(force=True)
+                    pass
+                else:
+                    if '@freediamond.in' in self.email:
+                        enqueue_for_relogin(self)
                     return
-            # Second Priority: Enqueue to background Never-Die Relogin Daemon
-            if '@freediamond.in' in self.email:
-                enqueue_for_relogin(self)
-            return
-
-        # 4. Ensure foreground session is active
-        if not self.session_id:
-            if not self.start_foreground_session(force=True):
+            else:
+                if '@freediamond.in' in self.email:
+                    enqueue_for_relogin(self)
                 return
 
-        # 5. Submit heartbeat (advances mining time & auto-claims completed quests on milestone)
-        self.tick_count = getattr(self, 'tick_count', 0) + 1
-        self.submit_heartbeat()
+        # 3. DIRECT LIVE API SYNC: Point Balance, Wallet & Daily Quests
+        # Uncoupled from heartbeat: runs immediately on node start and periodically (every 20 min)
+        last_sync = getattr(self, 'last_live_sync', 0)
+        if self.balance == 0 or not self.daily_claimed or not self.pinned_wallet or (now - last_sync) > 1200:
+            try:
+                self.check_round_redeem_status()
+                self.manual_daily_checkin()
+                self.last_live_sync = now
+                self.update_cluster_state()
+            except Exception:
+                pass
+
+        # 4. FOREGROUND SESSION / MINING ENGINE
+        # If already Mining Active with valid session, submit heartbeat immediately!
+        if self.session_id:
+            self.status = 'Mining Active'
+            self.tick_count = getattr(self, 'tick_count', 0) + 1
+            self.submit_heartbeat()
+            return
+
+        # Cooldown guard: if Alphea mining round is inactive, respect 10-15m retry interval to avoid spamming/timeouts
+        next_attempt = getattr(self, 'next_session_attempt', 0)
+        if now < next_attempt:
+            round_st = getattr(self, 'round_status', '')
+            if 'CLOSING' in round_st or 'CLOSED' in round_st:
+                self.status = 'Standby (Round Closing)'
+            elif '401' not in self.status:
+                self.status = 'Active (Synced)'
+            self.update_cluster_state()
+            return
+
+        # Ensure foreground session is active
+        if self.start_foreground_session():
+            self.status = 'Mining Active'
+            self.tick_count = getattr(self, 'tick_count', 0) + 1
+            self.submit_heartbeat()
+        else:
+            round_st = getattr(self, 'round_status', '')
+            if 'CLOSING' in round_st or 'CLOSED' in round_st:
+                self.status = 'Standby (Round Closing)'
+            elif '401' not in self.status:
+                self.status = 'Active (Standby)'
+            self.next_session_attempt = now + random.uniform(600, 900)  # 10-15m quiet backoff
+            self.update_cluster_state()
 
     def run(self):
         self.tick()
@@ -1731,7 +1776,7 @@ HTML_TEMPLATE = """
           <div class="node-title">{{ n.name }}</div>
           <div class="node-email">{{ n.email }}</div>
         </div>
-        <span class="badge {% if n.status == 'Mining Active' %}badge-green{% elif '401' in n.status or 'Dead' in n.status or 'Expired' in n.status or 'Timeout' in n.status %}badge-red{% else %}badge-yellow{% endif %}">
+        <span class="badge {% if n.status == 'Mining Active' or 'Standby' in n.status or ('Active' in n.status and not ('401' in n.status or 'Dead' in n.status or 'Expired' in n.status or 'Timeout' in n.status)) %}badge-green{% elif '401' in n.status or 'Dead' in n.status or 'Expired' in n.status or 'Timeout' in n.status %}badge-red{% else %}badge-yellow{% endif %}">
           {{ n.status }}
         </span>
       </div>
@@ -1934,7 +1979,7 @@ def route_dashboard():
     with NODES_LOCK:
         for node in NODES:
             node.update_cluster_state()
-    active_cnt = sum(1 for n in CLUSTER_STATE.values() if n.get('status') == 'Mining Active')
+    active_cnt = sum(1 for n in CLUSTER_STATE.values() if n.get('status') == 'Mining Active' or 'Standby' in n.get('status', '') or ('Active' in n.get('status', '') and not ('Dead' in n.get('status', '') or '401' in n.get('status', ''))))
     total_pts = sum(n.get('balance', 0) for n in CLUSTER_STATE.values())
     redeemed_cnt = sum(1 for n in CLUSTER_STATE.values() if 'Claimed' in n.get('redeem_status_text', ''))
     daily_claimed_cnt = sum(1 for n in CLUSTER_STATE.values() if n.get('daily_claimed') is True)
@@ -1965,7 +2010,7 @@ def route_health():
     h = uptime_sec // 3600
     m = (uptime_sec % 3600) // 60
     s = uptime_sec % 60
-    active_cnt = sum(1 for n in CLUSTER_STATE.values() if 'Mining' in n.get('status', ''))
+    active_cnt = sum(1 for n in CLUSTER_STATE.values() if n.get('status') == 'Mining Active' or 'Standby' in n.get('status', '') or ('Active' in n.get('status', '') and not ('Dead' in n.get('status', '') or '401' in n.get('status', ''))))
     return jsonify({
         'status': 'paused' if PAUSE_MODE else 'ok',
         'message': 'Cluster 2 is safely PAUSED (Sleep Mode). Zero threads, zero OTPs, zero CPU usage.' if PAUSE_MODE else 'Cluster 2 active',
