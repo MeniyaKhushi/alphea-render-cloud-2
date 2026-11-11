@@ -42,6 +42,8 @@ CLUSTER_LOGS = []
 LOGS_LOCK = threading.Lock()
 NODES_LOCK = threading.Lock()
 OTP_LOCK = threading.Lock()
+OTP_REQUEST_LOCK = threading.Lock()
+OTP_VERIFY_LOCK = threading.Lock()
 SESSION_START_LOCK = threading.Lock()
 SESSION_START_SEMAPHORE = threading.Semaphore(4)
 
@@ -363,168 +365,157 @@ class AccountWorker:
 
     def auto_relogin_via_otp(self):
         """
-        Never-Die Auto-Relogin System:
+        Never-Die Auto-Relogin System (High-Speed Concurrent Stagger Engine):
         Only works for @freediamond.in accounts (we own the inbox via otp.freediamond.in).
         Flow:
-          1. POST RequestEmailChallenge -> get challengeId
-          2. Poll otp.freediamond.in/get-otp?email=... (max 60s)
-          3. POST VerifyEmailChallenge with code -> get fresh accessToken + refreshToken
-          4. Inject new tokens, save to GitHub
+          1. POST RequestEmailChallenge with brief IP stagger lock (eliminates 503 rate limit)
+          2. Poll otp.freediamond.in in parallel without lock (each account has unique inbox)
+          3. POST VerifyEmailChallenge with brief verify lock -> inject tokens -> update state
         """
         if '@freediamond.in' not in self.email:
             add_log(f"[{self.name}] Auto-relogin skipped (non-freediamond.in account: {self.email})")
             return False
 
-        # Rate-limit: don't attempt more than once per 5 minutes
         now = time.time()
-        if hasattr(self, '_last_relogin_attempt') and now - self._last_relogin_attempt < 300:
+        if hasattr(self, '_last_relogin_attempt') and now - self._last_relogin_attempt < 180:
             return False
-
-        # Non-blocking lock: Only 1 account runs OTP relogin at a time so workers NEVER freeze or timeout!
-        if not OTP_LOCK.acquire(blocking=False):
-            return False
-
         self._last_relogin_attempt = now
 
-        try:
-            add_log(f"[{self.name}] 🔄 NEVER-DIE: Initiating OTP auto-relogin for {self.email} (Acquired OTP_LOCK)...")
+        auth_url = f"{BASE_URL}/alphea.connect.v1.AuthService/RequestEmailChallenge"
+        verify_url = f"{BASE_URL}/alphea.connect.v1.AuthService/VerifyEmailChallenge"
+        headers = {
+            'Content-Type': 'application/json',
+            'Connect-Protocol-Version': '1',
+            'Origin': 'https://hub.alphea.ai',
+            'Referer': 'https://hub.alphea.ai/',
+            'User-Agent': self.user_agent
+        }
+
+        challenge_id = None
+        # Step 1: Request Challenge with brief rate-limit guard
+        with OTP_REQUEST_LOCK:
+            add_log(f"[{self.name}] 🔄 NEVER-DIE: Requesting challenge for {self.email}...")
             self.status = "Auto-Relogin: Requesting OTP..."
             self.update_cluster_state()
 
-            auth_url = f"{BASE_URL}/alphea.connect.v1.AuthService/RequestEmailChallenge"
-            verify_url = f"{BASE_URL}/alphea.connect.v1.AuthService/VerifyEmailChallenge"
-            headers = {
-                'Content-Type': 'application/json',
-                'Connect-Protocol-Version': '1',
-                'Origin': 'https://hub.alphea.ai',
-                'Referer': 'https://hub.alphea.ai/',
-                'User-Agent': self.user_agent
-            }
-
             try:
-                # Step 0: Pre-clear stale OTP from inbox before requesting new challenge
                 try:
                     requests.get(f"https://otp.freediamond.in/clear-otp?email={self.email}", timeout=8)
                 except Exception:
                     pass
 
-                # Step 1: Request OTP challenge
                 r = self.session.post(auth_url, headers=headers,
-                                  json={'email': self.email, 'delivery': 'EMAIL_DELIVERY_OTP'},
-                                  timeout=35)
+                                      json={'email': self.email, 'delivery': 'EMAIL_DELIVERY_OTP'},
+                                      timeout=35)
                 if r.status_code != 200:
-                    add_log(f"[{self.name}] OTP request failed: {r.status_code} {r.text[:80]}")
+                    add_log(f"[{self.name}] OTP challenge failed: {r.status_code} {r.text[:60]}")
                     self.status = f"Auto-Relogin Failed ({r.status_code})"
                     self.update_cluster_state()
-                    time.sleep(2.0)
+                    time.sleep(1.5)
                     return False
 
                 challenge_id = r.json().get('challengeId') or r.json().get('challenge_id', '')
                 if not challenge_id:
-                    add_log(f"[{self.name}] No challengeId in response: {r.text[:100]}")
-                    time.sleep(2.0)
+                    add_log(f"[{self.name}] No challengeId in response")
+                    time.sleep(1.5)
                     return False
 
-                add_log(f"[{self.name}] OTP requested. Challenge: {challenge_id[:12]}... Polling inbox...")
-                self.status = "Auto-Relogin: Waiting for OTP..."
-                self.update_cluster_state()
-
-                # Step 2: Poll otp.freediamond.in for fresh OTP (max 90 seconds)
-                otp_code = None
-                otp_api = f"https://otp.freediamond.in/get-otp?email={self.email}"
-                for attempt in range(30):
-                    time.sleep(3)
-                    try:
-                        otp_r = requests.get(otp_api, timeout=10)
-                        if otp_r.status_code == 200:
-                            otp_data = otp_r.json()
-                            candidate = otp_data.get('otp')
-                            if candidate and candidate not in ['000000', '123456', '111111']:
-                                otp_code = candidate
-                                add_log(f"[{self.name}] OTP received: {otp_code} (attempt {attempt+1})")
-                                break
-                    except Exception as e:
-                        add_log(f"[{self.name}] OTP poll error: {e}")
-                        continue
-
-                if not otp_code:
-                    add_log(f"[{self.name}] OTP not received within 90s. Relogin aborted.")
-                    self.status = "Auto-Relogin: OTP Timeout"
-                    self.update_cluster_state()
-                    time.sleep(2.0)
-                    return False
-
-                # Step 3: Verify OTP and get fresh tokens (with 2-attempt retry on transient network timeout)
-                verify_payload = {
-                    'email': self.email,
-                    'challengeId': challenge_id,
-                    'code': otp_code
-                }
-                vr = None
-                for v_att in range(2):
-                    try:
-                        vr = self.session.post(verify_url, headers=headers, json=verify_payload, timeout=35)
-                        if vr.status_code == 200:
-                            break
-                        elif vr.status_code in (408, 429, 500, 502, 503, 504):
-                            time.sleep(2.0)
-                            continue
-                        else:
-                            break
-                    except Exception as ve:
-                        if v_att == 0:
-                            time.sleep(2.0)
-                            continue
-                        raise ve
-
-                if not vr or vr.status_code != 200:
-                    err_status = vr.status_code if vr else "Timeout"
-                    err_text = vr.text[:80] if vr else "Timeout"
-                    add_log(f"[{self.name}] OTP verify failed: {err_status} {err_text}")
-                    self.status = f"Auto-Relogin: Verify Failed ({err_status})"
-                    self.update_cluster_state()
-                    self._last_relogin_attempt = time.time() - 240
-                    time.sleep(2.0)
-                    return False
-
-                session_data = vr.json().get('session', {})
-                new_access = session_data.get('accessToken')
-                new_refresh = session_data.get('refreshToken')
-
-                if not new_access or not new_refresh:
-                    add_log(f"[{self.name}] No tokens in verify response: {vr.text[:100]}")
-                    time.sleep(2.0)
-                    return False
-
-                # Step 4: Inject fresh tokens
-                self.access_token = new_access
-                self.refresh_token = new_refresh
-                self.jwt_exp = decode_jwt_exp(new_access)
-                self.consecutive_errors = 0
-                self.status = 'Mining Active'
-                self.save_updated_tokens()
-                self.update_cluster_state()
-
-                # Clear OTP from worker to avoid re-use
-                try:
-                    requests.get(f"https://otp.freediamond.in/clear-otp?email={self.email}", timeout=5)
-                except Exception:
-                    pass
-
-                exp_mins = max(0, int((self.jwt_exp - time.time()) // 60)) if self.jwt_exp else 0
-                add_log(f"[{self.name}] ✅ NEVER-DIE SUCCESS: Fresh tokens injected! JWT valid for ~{exp_mins}m")
-                time.sleep(2.0)
-                return True
-
+                time.sleep(1.2)
             except Exception as e:
-                add_log(f"[{self.name}] Auto-relogin exception: {e}")
-                self.status = "Auto-Relogin: Error"
-                self.update_cluster_state()
-                self._last_relogin_attempt = time.time() - 240
-                time.sleep(2.0)
+                add_log(f"[{self.name}] Challenge error: {e}")
                 return False
-        finally:
-            OTP_LOCK.release()
+
+        # Step 2: Poll inbox in parallel (NO LOCK: independent inboxes)
+        add_log(f"[{self.name}] Challenge acquired ({challenge_id[:8]}...). Polling inbox...")
+        self.status = "Auto-Relogin: Waiting for OTP..."
+        self.update_cluster_state()
+
+        otp_code = None
+        otp_api = f"https://otp.freediamond.in/get-otp?email={self.email}"
+        for attempt in range(25):
+            time.sleep(2.5)
+            try:
+                otp_r = requests.get(otp_api, timeout=10)
+                if otp_r.status_code == 200:
+                    otp_data = otp_r.json()
+                    candidate = otp_data.get('otp')
+                    if candidate and candidate not in ['000000', '123456', '111111']:
+                        otp_code = candidate
+                        add_log(f"[{self.name}] OTP received: {otp_code} (attempt {attempt+1})")
+                        break
+            except Exception:
+                continue
+
+        if not otp_code:
+            add_log(f"[{self.name}] OTP poll timed out. Relogin aborted.")
+            self.status = "Auto-Relogin: OTP Timeout"
+            self.update_cluster_state()
+            return False
+
+        # Step 3: Verify OTP and inject fresh tokens
+        verify_payload = {
+            'email': self.email,
+            'challengeId': challenge_id,
+            'code': otp_code
+        }
+        vr = None
+        with OTP_VERIFY_LOCK:
+            for v_att in range(2):
+                try:
+                    vr = self.session.post(verify_url, headers=headers, json=verify_payload, timeout=35)
+                    if vr.status_code == 200:
+                        break
+                    elif vr.status_code in (408, 429, 500, 502, 503, 504):
+                        time.sleep(1.5)
+                        continue
+                    else:
+                        break
+                except Exception as ve:
+                    if v_att == 0:
+                        time.sleep(1.5)
+                        continue
+                    raise ve
+            time.sleep(1.0)
+
+        if not vr or vr.status_code != 200:
+            err_status = vr.status_code if vr else "Timeout"
+            add_log(f"[{self.name}] OTP verify failed: {err_status}")
+            self.status = f"Auto-Relogin: Verify Failed ({err_status})"
+            self.update_cluster_state()
+            return False
+
+        session_data = vr.json().get('session', {})
+        new_access = session_data.get('accessToken')
+        new_refresh = session_data.get('refreshToken')
+
+        if not new_access or not new_refresh:
+            add_log(f"[{self.name}] No tokens in verify response")
+            return False
+
+        self.access_token = new_access
+        self.refresh_token = new_refresh
+        self.jwt_exp = decode_jwt_exp(new_access)
+        self.consecutive_errors = 0
+
+        round_st = getattr(self, 'round_status', '')
+        if 'CLOSING' in round_st or 'CLOSED' in round_st:
+            self.status = 'Standby (Round Closing)'
+        else:
+            self.status = 'Active (Synced)'
+
+        self.save_updated_tokens()
+        self.check_round_redeem_status()
+        self.manual_daily_checkin()
+        self.update_cluster_state()
+
+        try:
+            requests.get(f"https://otp.freediamond.in/clear-otp?email={self.email}", timeout=5)
+        except Exception:
+            pass
+
+        exp_mins = max(0, int((self.jwt_exp - time.time()) // 60)) if self.jwt_exp else 0
+        add_log(f"[{self.name}] ✅ NEVER-DIE SUCCESS: Fresh tokens injected! JWT valid for ~{exp_mins}m")
+        return True
 
     def refresh_access_token(self):
         if not self.refresh_token:
@@ -1497,15 +1488,15 @@ class ClusterDispatcher(threading.Thread):
 
 cluster_dispatcher_instance = None
 
-# ---------------- DEDICATED BACKGROUND NEVER-DIE RELOGIN DAEMON ----------------
-class ReloginDaemon(threading.Thread):
-    def __init__(self):
-        super().__init__(name="ReloginDaemon", daemon=True)
+# ---------------- DEDICATED BACKGROUND NEVER-DIE RELOGIN DAEMON POOL (4x TURBO) ----------------
+class ReloginWorker(threading.Thread):
+    def __init__(self, worker_id=1):
+        super().__init__(name=f"ReloginWorker-{worker_id}", daemon=True)
+        self.worker_id = worker_id
         self.is_running = True
 
     def run(self):
-        add_log("[RELOGIN DAEMON] Dedicated background Never-Die OTP worker started.")
-        time.sleep(5)
+        time.sleep(2 + self.worker_id * 1.5)
         while self.is_running:
             if PAUSE_MODE:
                 time.sleep(5)
@@ -1515,65 +1506,87 @@ class ReloginDaemon(threading.Thread):
             try:
                 target_node = RELOGIN_QUEUE.get(timeout=3)
             except queue.Empty:
-                with NODES_LOCK:
-                    for n in NODES:
-                        if '@freediamond.in' in n.email:
-                            jwt_still_valid = n.jwt_exp and time.time() < (n.jwt_exp - 30)
-                            # ONLY truly dead if token is expired AND 401/Dead explicitly confirmed!
-                            is_truly_dead = (
-                                not jwt_still_valid and
-                                ('401' in n.status or 'Dead' in n.status or not n.access_token) and
-                                n.index not in RELOGIN_QUEUED_SET
-                            )
-                            if is_truly_dead:
-                                enqueue_for_relogin(n)
-                                break
+                if self.worker_id == 1:
+                    with NODES_LOCK:
+                        for n in NODES:
+                            if '@freediamond.in' in n.email:
+                                jwt_still_valid = n.jwt_exp and time.time() < (n.jwt_exp - 30)
+                                is_truly_dead = (
+                                    not jwt_still_valid and
+                                    ('401' in n.status or 'Dead' in n.status or not n.access_token) and
+                                    n.index not in RELOGIN_QUEUED_SET
+                                )
+                                if is_truly_dead:
+                                    enqueue_for_relogin(n)
+                                    break
                 time.sleep(2)
                 continue
 
             try:
                 # 1. Check if node already recovered or has valid token
-                if target_node.jwt_exp and time.time() < (target_node.jwt_exp - 30) and target_node.session_id:
-                    target_node.status = 'Mining Active'
+                if target_node.jwt_exp and time.time() < (target_node.jwt_exp - 30):
+                    round_st = getattr(target_node, 'round_status', '')
+                    if target_node.session_id:
+                        target_node.status = 'Mining Active'
+                    elif 'CLOSING' in round_st or 'CLOSED' in round_st:
+                        target_node.status = 'Standby (Round Closing)'
+                    else:
+                        target_node.status = 'Active (Synced)'
                     target_node.update_cluster_state()
                     continue
 
                 # 2. Fast-Path Silent Refresh (0.5s instead of 60s OTP)
                 if target_node.refresh_token and 'Invalid' not in target_node.status:
                     if target_node.refresh_access_token():
-                        if not target_node.session_id:
-                            target_node.start_foreground_session(force=True)
                         target_node.fetch_and_claim_quests()
                         target_node.check_round_redeem_status()
-                        threading.Thread(target=target_node.check_and_claim_sponsored_rewards, kwargs={'max_wait_seconds': 360}, daemon=True).start()
-                        target_node.status = 'Mining Active'
+                        round_st = getattr(target_node, 'round_status', '')
+                        if 'CLOSING' in round_st or 'CLOSED' in round_st:
+                            target_node.status = 'Standby (Round Closing)'
+                        else:
+                            target_node.status = 'Active (Synced)'
                         target_node.update_cluster_state()
                         if cluster_dispatcher_instance:
                             cluster_dispatcher_instance.next_run[target_node.index] = time.time()
-                        add_log(f"[RELOGIN DAEMON] ⚡ Fast silent-refresh revived {target_node.name}! Now Mining Active.")
+                        add_log(f"[RELOGIN W-{self.worker_id}] ⚡ Fast silent-refresh revived {target_node.name}!")
                         continue
 
                 # 3. Only if token is truly rejected (401) or missing, run full OTP relogin
-                add_log(f"[RELOGIN DAEMON] Processing OTP auto-relogin for {target_node.name} ({target_node.email})...")
+                add_log(f"[RELOGIN W-{self.worker_id}] Processing OTP auto-relogin for {target_node.name} ({target_node.email})...")
                 success = target_node.auto_relogin_via_otp()
                 if success:
-                    if not target_node.session_id:
-                        target_node.start_foreground_session(force=True)
                     target_node.fetch_and_claim_quests()
                     target_node.check_round_redeem_status()
-                    threading.Thread(target=target_node.check_and_claim_sponsored_rewards, kwargs={'max_wait_seconds': 360}, daemon=True).start()
+                    round_st = getattr(target_node, 'round_status', '')
+                    if 'CLOSING' in round_st or 'CLOSED' in round_st:
+                        target_node.status = 'Standby (Round Closing)'
+                    else:
+                        target_node.status = 'Active (Synced)'
+                    target_node.update_cluster_state()
                     if cluster_dispatcher_instance:
                         cluster_dispatcher_instance.next_run[target_node.index] = time.time()
-                    add_log(f"[RELOGIN DAEMON] ✅ Successfully revived {target_node.name}! Now Mining Active.")
+                    add_log(f"[RELOGIN W-{self.worker_id}] ✅ Successfully revived {target_node.name}!")
                 else:
-                    add_log(f"[RELOGIN DAEMON] ⚠️ Relogin failed for {target_node.name}. Will retry later.")
+                    add_log(f"[RELOGIN W-{self.worker_id}] ⚠️ Relogin failed for {target_node.name}. Will retry later.")
             except Exception as e:
-                add_log(f"[RELOGIN DAEMON] Error processing {target_node.name}: {e}")
+                add_log(f"[RELOGIN W-{self.worker_id}] Error processing {target_node.name}: {e}")
             finally:
                 with RELOGIN_LOCK:
                     RELOGIN_QUEUED_SET.discard(target_node.index)
                 RELOGIN_QUEUE.task_done()
-                time.sleep(2)
+                time.sleep(1)
+
+class ReloginDaemon:
+    def __init__(self, num_workers=4):
+        self.workers = [ReloginWorker(i+1) for i in range(num_workers)]
+
+    def start(self):
+        add_log(f"[RELOGIN DAEMON] Turbo Multi-Worker Engine started ({len(self.workers)} concurrent OTP threads).")
+        for w in self.workers:
+            w.start()
+
+    def is_alive(self):
+        return any(w.is_alive() for w in self.workers)
 
 relogin_daemon_instance = None
 
