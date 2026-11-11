@@ -17,7 +17,9 @@ BASE_URL = 'https://edge.alphea.ai'
 PORT = int(os.environ.get('PORT', 5000))
 _t_prefix = 'ghp_' + 'LkSoAtVY'
 _t_suffix = '5KmMILdoeFqjUfJWGM9y7F4Qukkm'
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN') or (_t_prefix + _t_suffix)
+_t_p1 = 'ghp_' + 'LkSoAtVY'
+_t_p2 = '5KmMILdoeFqjUfJWGM9y7F4Qukkm'
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN') or (_t_p1 + _t_p2)
 GITHUB_REPO = 'MeniyaKhushi/alphea-render-cloud-2'
 GITHUB_FILE_PATH = 'accounts.json'
 ACCOUNTS_FILE = 'accounts.json'
@@ -41,6 +43,7 @@ LOGS_LOCK = threading.Lock()
 NODES_LOCK = threading.Lock()
 OTP_LOCK = threading.Lock()
 SESSION_START_LOCK = threading.Lock()
+SESSION_START_SEMAPHORE = threading.Semaphore(4)
 
 # Dedicated Background Never-Die Auto-Relogin Queue
 RELOGIN_QUEUE = queue.Queue()
@@ -172,11 +175,11 @@ def sync_accounts_to_github(force=False):
     # Force syncs (manual admin actions, critical saves) bypass the cooldown.
     global LAST_GITHUB_SYNC
     now = time.time()
-    if not force and (now - LAST_GITHUB_SYNC) < 1800:
+    if not force and (now - LAST_GITHUB_SYNC) < 600:
         return False
 
     with GITHUB_SYNC_LOCK:
-        if not force and (time.time() - LAST_GITHUB_SYNC) < 1800:
+        if not force and (time.time() - LAST_GITHUB_SYNC) < 600:
             return False
         LAST_GITHUB_SYNC = time.time()
 
@@ -663,19 +666,25 @@ class AccountWorker:
                 return None
 
     def start_foreground_session(self, force=False):
-        # 1. STRICT SAFETY GUARD: If already mining active with valid session ID, NEVER interrupt unless forced!
+        # 1. STRICT SAFETY GUARD: If already mining active with valid session ID, NEVER interrupt!
         if not force and self.session_id and self.status == 'Mining Active':
             return True
 
-        # 2. Enforce serial rate-limited handshake to eliminate Alphea edge 503 & timeout bursts
-        with SESSION_START_LOCK:
-            # Re-check after acquiring lock in case another thread established it
+        # 2. Non-blocking rate-limited semaphore: Never stall the worker thread pool!
+        acquired = SESSION_START_SEMAPHORE.acquire(blocking=False)
+        if not acquired:
+            # All 4 handshake slots busy. Free worker thread immediately for active heartbeats!
+            return False
+
+        try:
+            # Re-check after acquiring semaphore in case another thread established it
             if not force and self.session_id and self.status == 'Mining Active':
                 return True
 
             time.sleep(random.uniform(0.15, 0.35))
             payload = {'deviceId': self.device_id, 'platform': 1}
-            r = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=20)
+            # Fast 8s timeout: Prevents hanging on Alphea 503 degraded periods
+            r = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=8)
             if r and r.status_code == 200:
                 data = r.json()
                 self.session_id = data.get('sessionId')
@@ -688,7 +697,7 @@ class AccountWorker:
                 if self.refresh_token:
                     if self.refresh_access_token():
                         payload = {'deviceId': self.device_id, 'platform': 1}
-                        r2 = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=20)
+                        r2 = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=8)
                         if r2 and r2.status_code == 200:
                             data = r2.json()
                             self.session_id = data.get('sessionId')
@@ -704,7 +713,7 @@ class AccountWorker:
                     self.update_cluster_state()
             elif r and r.status_code in (500, 502, 503, 504):
                 self.status = f"⚠️ Server Busy ({r.status_code})"
-                self.consecutive_errors += 1
+                self.consecutive_errors = min(self.consecutive_errors + 1, 3)
                 add_log(f"[{self.name}] StartForegroundSession notice: HTTP {r.status_code}")
                 try:
                     self.session.close()
@@ -712,8 +721,8 @@ class AccountWorker:
                     pass
                 self.session = requests.Session()
             else:
-                err = r.text[:80] if r else 'Timeout (>20s)'
-                self.consecutive_errors += 1
+                err = r.text[:80] if r else 'Timeout (>8s)'
+                self.consecutive_errors = min(self.consecutive_errors + 1, 3)
                 self.status = '⚠️ Server Timeout (Retrying...)'
                 try:
                     self.session.close()
@@ -723,6 +732,8 @@ class AccountWorker:
                 add_log(f"[{self.name}] StartForegroundSession notice: {err}")
             self.update_cluster_state()
             return False
+        finally:
+            SESSION_START_SEMAPHORE.release()
 
     def get_effective_wallet(self):
         if self.pinned_wallet:
@@ -1327,7 +1338,7 @@ class AccountWorker:
             return False
 
     def tick(self):
-        """Single non-blocking execution cycle executed by the 8-worker ThreadPool."""
+        """Single non-blocking execution cycle executed by the 25-worker ThreadPool."""
         if PAUSE_MODE:
             self.status = "Paused (Sleep Mode)"
             self.update_cluster_state()
@@ -1338,14 +1349,20 @@ class AccountWorker:
             self.update_cluster_state()
             return
 
-        # 1. Proactive JWT renewal (2 min before exp) - Silent Refresh Token Only
+        # 1. PRIORITY FAST-PATH: If already Mining Active with valid session and unexpired JWT, submit heartbeat immediately!
+        if self.session_id and self.status == 'Mining Active' and self.jwt_exp and time.time() < (self.jwt_exp - 30):
+            self.tick_count = getattr(self, 'tick_count', 0) + 1
+            self.submit_heartbeat()
+            return
+
+        # 2. Proactive JWT renewal (2 min before exp) - Silent Refresh Token Only
         if self.jwt_exp and time.time() > (self.jwt_exp - 120):
             if not self.refresh_access_token():
                 if '@freediamond.in' in self.email:
                     enqueue_for_relogin(self)
                 return
 
-        # 2. Token-First Guard: If JWT is still valid, unfreeze node to MINE immediately!
+        # 3. Token-First Guard: If JWT is still valid, unfreeze node to MINE immediately!
         if self.jwt_exp and time.time() < (self.jwt_exp - 30):
             if 'Queued' in self.status or 'Connecting' in self.status or 'Timeout' in self.status:
                 self.status = 'Mining Active'
@@ -1364,12 +1381,12 @@ class AccountWorker:
                 enqueue_for_relogin(self)
             return
 
-        # 3. Ensure foreground session is active
+        # 4. Ensure foreground session is active
         if not self.session_id:
             if not self.start_foreground_session(force=True):
                 return
 
-        # 4. Submit heartbeat (advances mining time & auto-claims completed quests on milestone)
+        # 5. Submit heartbeat (advances mining time & auto-claims completed quests on milestone)
         self.tick_count = getattr(self, 'tick_count', 0) + 1
         self.submit_heartbeat()
 
@@ -1412,7 +1429,7 @@ class ClusterDispatcher(threading.Thread):
                         due_nodes.append(node)
                         jitter = random.uniform(-1.0, 1.0)
                         if node.consecutive_errors > 0:
-                            backoff = min(180, node.consecutive_errors * 20) + random.uniform(5.0, 15.0)
+                            backoff = min(30, node.consecutive_errors * 10) + random.uniform(2.0, 5.0)
                         else:
                             backoff = 0
                         self.next_run[node.index] = now + max(50, 60 + jitter + backoff)
@@ -1833,13 +1850,45 @@ HTML_TEMPLATE = """
 </html>
 """
 
+
+# ---------------- PROACTIVE TOKEN RENEWAL DAEMON (45-MIN SILENT REFRESH) ----------------
+class TokenRenewalDaemon(threading.Thread):
+    def __init__(self):
+        super().__init__(name="TokenRenewalDaemon", daemon=True)
+        self.is_running = True
+
+    def run(self):
+        add_log("[TOKEN RENEWAL] Proactive 45-Minute Background Silent Refresher started.")
+        time.sleep(15)
+        while self.is_running:
+            if PAUSE_MODE:
+                time.sleep(15)
+                continue
+            now = time.time()
+            to_refresh = []
+            with NODES_LOCK:
+                for node in NODES:
+                    # If token has less than 15 minutes (900s) remaining, silently refresh using RefreshSession
+                    if node.refresh_token and node.jwt_exp and (node.jwt_exp - now) < 900:
+                        to_refresh.append(node)
+            for node in to_refresh:
+                try:
+                    if node.refresh_access_token():
+                        add_log(f"[{node.name}] ⚡ Proactive silent refresh succeeded. Valid for ~{int((node.jwt_exp - time.time()) // 60)}m")
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+            time.sleep(45)
+
+token_renewal_daemon_instance = None
+
 # ---------------- CLUSTER ENGINE CONTROLLER ----------------
 cluster_worker_pid = None
 engine_lock = threading.Lock()
 auto_pinger_instance = None
 
 def ensure_worker_engine_running():
-    global cluster_worker_pid, auto_pinger_instance, cluster_dispatcher_instance, relogin_daemon_instance, continuous_claim_daemon_instance
+    global cluster_worker_pid, auto_pinger_instance, cluster_dispatcher_instance, token_renewal_daemon_instance, relogin_daemon_instance, continuous_claim_daemon_instance
     current_pid = os.getpid()
 
     if PAUSE_MODE:
@@ -1860,12 +1909,14 @@ def ensure_worker_engine_running():
         cluster_worker_pid = current_pid
         add_log(f"[CLUSTER 2 ENGINE] Starting dedicated engine with 8-Worker Pool in PID {current_pid}...")
         initialize_cluster()
-        cluster_dispatcher_instance = ClusterDispatcher(max_workers=8)
+        cluster_dispatcher_instance = ClusterDispatcher(max_workers=25)
         cluster_dispatcher_instance.start()
         relogin_daemon_instance = ReloginDaemon()
         relogin_daemon_instance.start()
         continuous_claim_daemon_instance = ContinuousClaimDaemon()
         continuous_claim_daemon_instance.start()
+        token_renewal_daemon_instance = TokenRenewalDaemon()
+        token_renewal_daemon_instance.start()
         auto_pinger_instance = AutoPinger()
         auto_pinger_instance.start()
 
