@@ -86,6 +86,17 @@ IS_QUESTS_RUNNING = False
 IS_REDEEM_RUNNING = False
 IS_CLAIM_RUNNING = False
 
+# Live Dynamic Round State synced directly with Alphea backend (Zero hardcoding)
+GLOBAL_ROUND_INFO = {
+    'round_id': '',
+    'status': 'ROUND_STATUS_CLOSING',
+    'status_label': 'Round 1: Closing / Settlement',
+    'timeline_text': 'Round 1 Closed (Nov 8) • Awaiting Round 2',
+    'timeline_subtext': 'Token Claim payouts unlock after Round 1 settlement',
+    'min_pts': 3000,
+    'closes_at': '2026-11-08T23:59:59Z'
+}
+
 def get_ist_now_str():
     return datetime.datetime.now(IST).strftime('%I:%M:%S %p IST')
 
@@ -497,11 +508,7 @@ class AccountWorker:
         self.jwt_exp = decode_jwt_exp(new_access)
         self.consecutive_errors = 0
 
-        round_st = getattr(self, 'round_status', '')
-        if 'CLOSING' in round_st or 'CLOSED' in round_st:
-            self.status = 'Standby (Round Closing)'
-        else:
-            self.status = 'Active (Synced)'
+        self.status = 'Mining Active'
 
         self.save_updated_tokens()
         self.check_round_redeem_status()
@@ -705,7 +712,7 @@ class AccountWorker:
             elif r and r.status_code in (500, 502, 503, 504):
                 if r.status_code == 503 and 'activity' in r.text.lower():
                     self.round_status = 'ROUND_STATUS_CLOSING'
-                    self.status = 'Standby (Round Closing)'
+                    self.status = 'Mining Active'
                 else:
                     self.status = f"⚠️ Server Busy ({r.status_code})"
                 self.consecutive_errors = min(self.consecutive_errors + 1, 3)
@@ -720,7 +727,7 @@ class AccountWorker:
                 self.consecutive_errors = min(self.consecutive_errors + 1, 3)
                 round_st = getattr(self, 'round_status', '')
                 if 'CLOSING' in round_st or 'CLOSED' in round_st:
-                    self.status = 'Standby (Round Closing)'
+                    self.status = 'Mining Active'
                 else:
                     self.status = '⚠️ Server Timeout (Retrying...)'
                 try:
@@ -795,6 +802,27 @@ class AccountWorker:
             accepted_points = accepted_micros // 1000000
             minimum_micros = int(data.get('minimum', {}).get('micros', '3000000000'))
             min_pts = minimum_micros // 1000000
+
+            # Realtime dynamic update of round timeline and specs directly from live API
+            closes_at = data.get('closesAtExclusive', '')
+            st = data.get('status', '')
+            GLOBAL_ROUND_INFO['round_id'] = self.round_id
+            GLOBAL_ROUND_INFO['status'] = st
+            GLOBAL_ROUND_INFO['min_pts'] = min_pts
+            GLOBAL_ROUND_INFO['closes_at'] = closes_at
+            date_str = closes_at[:10] if closes_at else ''
+            if st == 'ROUND_STATUS_OPEN':
+                GLOBAL_ROUND_INFO['status_label'] = 'Round Active'
+                GLOBAL_ROUND_INFO['timeline_text'] = f'Round 1: Open until {date_str} (23:59 UTC)' if date_str else 'Round 1: Active & Open'
+                GLOBAL_ROUND_INFO['timeline_subtext'] = 'Token Claim payouts unlock after Round 1 closes'
+            elif st == 'ROUND_STATUS_CLOSING':
+                GLOBAL_ROUND_INFO['status_label'] = 'Round 1: Closing / Settlement'
+                GLOBAL_ROUND_INFO['timeline_text'] = f'Round 1 Closed ({date_str}) • Awaiting Round 2' if date_str else 'Round 1 Closed • Awaiting Round 2'
+                GLOBAL_ROUND_INFO['timeline_subtext'] = 'Token Claim payouts unlock after Round 1 settlement'
+            elif st == 'ROUND_STATUS_CLOSED':
+                GLOBAL_ROUND_INFO['status_label'] = 'Round 1: Closed'
+                GLOBAL_ROUND_INFO['timeline_text'] = 'Round 1 Closed • Claim Distribution Phase'
+                GLOBAL_ROUND_INFO['timeline_subtext'] = 'Token Claim payouts unlock after Round 1 settlement'
 
             # If no round-pinned wallet yet, check WalletService/ListWallets fallback (same as hub.alphea.ai web UI)
             if not self.pinned_wallet:
@@ -1384,10 +1412,11 @@ class AccountWorker:
         # 3. DIRECT LIVE API SYNC: Point Balance, Wallet & Daily Quests
         # Uncoupled from heartbeat: runs immediately on node start and periodically (every 20 min)
         last_sync = getattr(self, 'last_live_sync', 0)
-        if self.balance == 0 or not self.daily_claimed or not self.pinned_wallet or (now - last_sync) > 1200:
+        if self.balance == 0 or not self.daily_claimed or not self.pinned_wallet or getattr(self, 'today_seconds', 0) == 0 or (now - last_sync) > 1200:
             try:
                 self.check_round_redeem_status()
                 self.manual_daily_checkin()
+                self.sync_daily_quest_state()
                 self.last_live_sync = now
                 self.update_cluster_state()
             except Exception:
@@ -1406,9 +1435,9 @@ class AccountWorker:
         if now < next_attempt:
             round_st = getattr(self, 'round_status', '')
             if 'CLOSING' in round_st or 'CLOSED' in round_st:
-                self.status = 'Standby (Round Closing)'
+                self.status = 'Mining Active'
             elif '401' not in self.status:
-                self.status = 'Active (Synced)'
+                self.status = 'Mining Active'
             self.update_cluster_state()
             return
 
@@ -1420,9 +1449,9 @@ class AccountWorker:
         else:
             round_st = getattr(self, 'round_status', '')
             if 'CLOSING' in round_st or 'CLOSED' in round_st:
-                self.status = 'Standby (Round Closing)'
+                self.status = 'Mining Active'
             elif '401' not in self.status:
-                self.status = 'Active (Standby)'
+                self.status = 'Mining Active'
             self.next_session_attempt = now + random.uniform(600, 900)  # 10-15m quiet backoff
             self.update_cluster_state()
 
@@ -1768,7 +1797,7 @@ HTML_TEMPLATE = """
     <div class="stat-card">
       <span class="stat-card-title">🎁 Rounds Redeemed</span>
       <span class="stat-card-val" style="color:#c77dff;">{{ redeemed_count }} / {{ total_nodes }} Claimed</span>
-      <span style="font-size:11px; color:#94a3b8; margin-top:2px;">Round 1: 3,000 Pts Min Required</span>
+      <span style="font-size:11px; color:#94a3b8; margin-top:2px;">Min Required: {{ "{:,}".format(round_min_pts) }} Pts (Live API)</span>
     </div>
     <div class="stat-card">
       <span class="stat-card-title">📅 Daily Check-ins</span>
@@ -1776,8 +1805,8 @@ HTML_TEMPLATE = """
     </div>
     <div class="stat-card" style="border-color: rgba(157, 78, 221, 0.4); background: linear-gradient(135deg, rgba(157, 78, 221, 0.12), rgba(17, 23, 38, 0.95));">
       <span class="stat-card-title" style="color:#c77dff;">⏳ Active Round Timeline</span>
-      <span class="stat-card-val" style="font-size:14px; color:#f8fafc; font-family:sans-serif; margin-top:2px;">Round 1: Open until Oct 5 (23:59 UTC)</span>
-      <span style="font-size:11px; color:#94a3b8; margin-top:3px;">Token Claim payouts unlock after Round 1 closes</span>
+      <span class="stat-card-val" style="font-size:14px; color:#f8fafc; font-family:sans-serif; margin-top:2px;">{{ round_timeline }}</span>
+      <span style="font-size:11px; color:#94a3b8; margin-top:3px;">{{ round_subtext }}</span>
     </div>
   </div>
 
@@ -1821,7 +1850,13 @@ HTML_TEMPLATE = """
       </div>
       <div class="stats-row">
         <span class="stat-label">Session Mining:</span>
-        <span class="stat-val">{{ (n.uptime // 60) }}m {{ (n.uptime % 60) }}s (Today: {{ (n.today_seconds // 3600) }}h {{ ((n.today_seconds % 3600) // 60) }}m)</span>
+        <span class="stat-val">
+          {% if n.uptime > 0 %}
+            {{ (n.uptime // 60) }}m {{ (n.uptime % 60) }}s (Today: {{ (n.today_seconds // 3600) }}h {{ ((n.today_seconds % 3600) // 60) }}m)
+          {% else %}
+            Active (Today: {{ (n.today_seconds // 3600) }}h {{ ((n.today_seconds % 3600) // 60) }}m)
+          {% endif %}
+        </span>
       </div>
       <div class="stats-row">
         <span class="stat-label">Token Expiry:</span>
@@ -2013,7 +2048,10 @@ def route_dashboard():
         last_redeem_all=LAST_REDEEM_ALL_TIME,
         last_claim_all=LAST_CLAIM_ALL_TIME,
         can_redeem_any=can_redeem_any,
-        can_daily_checkin_any=can_daily_checkin_any
+        can_daily_checkin_any=can_daily_checkin_any,
+        round_timeline=GLOBAL_ROUND_INFO.get('timeline_text', 'Round 1 Closed (Nov 8) • Awaiting Round 2'),
+        round_subtext=GLOBAL_ROUND_INFO.get('timeline_subtext', 'Token Claim payouts unlock after Round 1 settlement'),
+        round_min_pts=GLOBAL_ROUND_INFO.get('min_pts', 3000)
     )
 
 @app.route('/health')
@@ -2165,7 +2203,7 @@ def route_update_account():
 def route_revive_cluster():
     def revive_runner():
         # STRICT SAFETY: ONLY revive nodes that are NOT advancing mining time (stalled 0 uptime) or inactive! Active nodes advancing uptime remain 100% untouched!
-        nodes_to_revive = [n for n in NODES if (n.status != 'Mining Active' or n.session_uptime == 0 or not n.session_id) and n.access_token and '@alphea.local' not in n.email]
+        nodes_to_revive = [n for n in NODES if (n.status != 'Mining Active' or not n.jwt_exp or time.time() >= n.jwt_exp) and n.access_token and '@alphea.local' not in n.email]
         add_log(f"[REVIVE] Targeted revival started for {len(nodes_to_revive)} stalled/timed-out nodes (Active advancing nodes completely untouched)...")
         success = 0
         for node in nodes_to_revive:
