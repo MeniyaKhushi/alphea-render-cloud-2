@@ -508,7 +508,13 @@ class AccountWorker:
         self.jwt_exp = decode_jwt_exp(new_access)
         self.consecutive_errors = 0
 
-        self.status = 'Mining Active'
+        round_st = getattr(self, 'round_status', '')
+        if self.session_id:
+            self.status = 'Mining Active'
+        elif 'CLOSING' in round_st or 'CLOSED' in round_st:
+            self.status = 'Standby (Round Closing)'
+        else:
+            self.status = 'Active (Synced)'
 
         self.save_updated_tokens()
         self.check_round_redeem_status()
@@ -710,7 +716,7 @@ class AccountWorker:
             elif r and r.status_code in (500, 502, 503, 504):
                 if r.status_code == 503 and 'activity' in r.text.lower():
                     self.round_status = 'ROUND_STATUS_CLOSING'
-                    self.status = 'Mining Active'
+                    self.status = 'Standby (Round Closing)'
                 else:
                     self.status = f"⚠️ Server Busy ({r.status_code})"
                 self.consecutive_errors = min(self.consecutive_errors + 1, 3)
@@ -721,11 +727,11 @@ class AccountWorker:
                     pass
                 self.session = requests.Session()
             else:
-                err = r.text[:80] if r else 'Timeout (>8s)'
+                err = r.text[:80] if r else 'Timeout (>25s)'
                 self.consecutive_errors = min(self.consecutive_errors + 1, 3)
                 round_st = getattr(self, 'round_status', '')
                 if 'CLOSING' in round_st or 'CLOSED' in round_st:
-                    self.status = 'Mining Active'
+                    self.status = 'Standby (Round Closing)'
                 else:
                     self.status = '⚠️ Server Timeout (Retrying...)'
                 try:
@@ -1428,14 +1434,14 @@ class AccountWorker:
             self.submit_heartbeat()
             return
 
-        # Cooldown guard: if Alphea mining round is inactive, respect 10-15m retry interval to avoid spamming/timeouts
+        # Cooldown guard: if Alphea mining round is inactive, respect retry interval
         next_attempt = getattr(self, 'next_session_attempt', 0)
         if now < next_attempt:
             round_st = getattr(self, 'round_status', '')
             if 'CLOSING' in round_st or 'CLOSED' in round_st:
-                self.status = 'Mining Active'
-            elif '401' not in self.status:
-                self.status = 'Mining Active'
+                self.status = 'Standby (Round Closing)'
+            elif '401' not in self.status and not self.session_id:
+                self.status = 'Active (Synced)'
             self.update_cluster_state()
             return
 
@@ -1447,10 +1453,10 @@ class AccountWorker:
         else:
             round_st = getattr(self, 'round_status', '')
             if 'CLOSING' in round_st or 'CLOSED' in round_st:
-                self.status = 'Mining Active'
-            elif '401' not in self.status:
-                self.status = 'Mining Active'
-            self.next_session_attempt = now + random.uniform(600, 900)  # 10-15m quiet backoff
+                self.status = 'Standby (Round Closing)'
+            elif '401' not in self.status and not self.session_id:
+                self.status = 'Active (Synced)'
+            self.next_session_attempt = now + random.uniform(30.0, 60.0)  # Fast 30-60s retry to resume instantly when round opens
             self.update_cluster_state()
 
     def run(self):
@@ -1883,10 +1889,10 @@ HTML_TEMPLATE = """
       <div class="stats-row">
         <span class="stat-label">Session Mining:</span>
         <span class="stat-val">
-          {% if n.uptime > 0 %}
+          {% if n.uptime > 0 and n.session_id %}
             {{ (n.uptime // 60) }}m {{ (n.uptime % 60) }}s (Today: {{ (n.today_seconds // 3600) }}h {{ ((n.today_seconds % 3600) // 60) }}m)
           {% else %}
-            Active (Today: {{ (n.today_seconds // 3600) }}h {{ ((n.today_seconds % 3600) // 60) }}m)
+            0m 0s (Today: {{ (n.today_seconds // 3600) }}h {{ ((n.today_seconds % 3600) // 60) }}m)
           {% endif %}
         </span>
       </div>
