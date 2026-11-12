@@ -416,7 +416,7 @@ class AccountWorker:
                     pass
 
                 r = self.session.post(auth_url, headers=headers,
-                                      json={'email': self.email, 'delivery': 'EMAIL_DELIVERY_OTP'},
+                                      json={'email': self.email, 'delivery': 1},
                                       timeout=35)
                 if r.status_code != 200:
                     add_log(f"[{self.name}] OTP challenge failed: {r.status_code} {r.text[:60]}")
@@ -524,7 +524,7 @@ class AccountWorker:
         add_log(f"[{self.name}] ✅ NEVER-DIE SUCCESS: Fresh tokens injected! JWT valid for ~{exp_mins}m")
         return True
 
-    def refresh_access_token(self):
+    def refresh_access_token(self, force=False):
         if not self.refresh_token:
             self.status = "No Refresh Token"
             self.update_cluster_state()
@@ -533,9 +533,9 @@ class AccountWorker:
                 enqueue_for_relogin(self)
             return False
 
-        # Throttle refreshes to at most once per 60s
+        # Throttle refreshes unless force=True
         now = time.time()
-        if now - self.last_refresh_attempt < 60:
+        if not force and (now - self.last_refresh_attempt < 60):
             if self.jwt_exp and time.time() >= self.jwt_exp:
                 return False
             return bool(self.access_token)
@@ -625,7 +625,7 @@ class AccountWorker:
                 r = self.session.post(url, headers=headers, json=payload, timeout=timeout)
                 if r.status_code == 401:
                     add_log(f"[{self.name}] 401 on {path.split('/')[-1]}, attempting refresh...")
-                    if self.refresh_access_token():
+                    if self.refresh_access_token(force=True):
                         headers['Authorization'] = f"Bearer {self.access_token}"
                         r = self.session.post(url, headers=headers, json=payload, timeout=timeout)
                     else:
@@ -691,7 +691,7 @@ class AccountWorker:
                 return True
             elif r and r.status_code == 401:
                 if self.refresh_token:
-                    if self.refresh_access_token():
+                    if self.refresh_access_token(force=True):
                         payload = {'deviceId': self.device_id, 'platform': 1}
                         r2 = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=25)
                         if r2 and r2.status_code == 200:
@@ -1396,7 +1396,7 @@ class AccountWorker:
             if 'Auto-Relogin' in self.status:
                 return
             if self.refresh_token and 'Invalid' not in self.status:
-                if self.refresh_access_token():
+                if self.refresh_access_token(force=True):
                     pass
                 else:
                     if '@freediamond.in' in self.email:
