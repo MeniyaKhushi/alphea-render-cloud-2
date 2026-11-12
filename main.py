@@ -45,7 +45,7 @@ OTP_LOCK = threading.Lock()
 OTP_REQUEST_LOCK = threading.Lock()
 OTP_VERIFY_LOCK = threading.Lock()
 SESSION_START_LOCK = threading.Lock()
-SESSION_START_SEMAPHORE = threading.Semaphore(4)
+SESSION_START_SEMAPHORE = threading.Semaphore(10)
 
 # Dedicated Background Never-Die Auto-Relogin Queue
 RELOGIN_QUEUE = queue.Queue()
@@ -665,24 +665,22 @@ class AccountWorker:
 
     def start_foreground_session(self, force=False):
         # 1. STRICT SAFETY GUARD: If already mining active with valid session ID, NEVER interrupt!
-        if not force and self.session_id and self.status == 'Mining Active':
+        if not force and self.session_id:
             return True
 
-        # 2. Non-blocking rate-limited semaphore: Never stall the worker thread pool!
-        acquired = SESSION_START_SEMAPHORE.acquire(blocking=False)
+        # 2. Graceful rate-limited semaphore with 3s wait
+        acquired = SESSION_START_SEMAPHORE.acquire(timeout=3.0)
         if not acquired:
-            # All 4 handshake slots busy. Free worker thread immediately for active heartbeats!
             return False
 
         try:
-            # Re-check after acquiring semaphore in case another thread established it
-            if not force and self.session_id and self.status == 'Mining Active':
+            if not force and self.session_id:
                 return True
 
             time.sleep(random.uniform(0.15, 0.35))
             payload = {'deviceId': self.device_id, 'platform': 1}
-            # Fast 8s timeout: Prevents hanging on Alphea 503 degraded periods
-            r = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=8)
+            # Reliable 25s timeout
+            r = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=25)
             if r and r.status_code == 200:
                 data = r.json()
                 self.session_id = data.get('sessionId')
@@ -695,7 +693,7 @@ class AccountWorker:
                 if self.refresh_token:
                     if self.refresh_access_token():
                         payload = {'deviceId': self.device_id, 'platform': 1}
-                        r2 = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=8)
+                        r2 = self.authenticated_rpc('alphea.connect.v1.ActivityService/StartForegroundSession', payload, timeout=25)
                         if r2 and r2.status_code == 200:
                             data = r2.json()
                             self.session_id = data.get('sessionId')
@@ -1517,6 +1515,40 @@ class ClusterDispatcher(threading.Thread):
 
 cluster_dispatcher_instance = None
 
+# ---------------- DEDICATED SEQUENTIAL SESSION LAUNCHER (ZERO COLLISION) ----------------
+class SessionLauncherDaemon(threading.Thread):
+    def __init__(self):
+        super().__init__(name="SessionLauncherDaemon", daemon=True)
+        self.is_running = True
+
+    def run(self):
+        time.sleep(3)
+        add_log("[LAUNCHER] Dedicated Sequential Session Launcher active. Establishing sessions across all nodes...")
+        while self.is_running:
+            if PAUSE_MODE:
+                time.sleep(5)
+                continue
+            unconnected = [
+                n for n in NODES 
+                if not n.session_id and n.access_token and '@alphea.local' not in n.email and '401' not in n.status and 'Dead' not in n.status
+            ]
+            if not unconnected:
+                time.sleep(15)
+                continue
+            for node in unconnected:
+                if PAUSE_MODE or not self.is_running:
+                    break
+                if not node.session_id:
+                    try:
+                        node.start_foreground_session(force=True)
+                    except Exception:
+                        pass
+                    time.sleep(random.uniform(0.6, 1.0))
+            time.sleep(10)
+
+session_launcher_daemon_instance = None
+
+
 # ---------------- DEDICATED BACKGROUND NEVER-DIE RELOGIN DAEMON POOL (4x TURBO) ----------------
 class ReloginWorker(threading.Thread):
     def __init__(self, worker_id=1):
@@ -1981,7 +2013,7 @@ engine_lock = threading.Lock()
 auto_pinger_instance = None
 
 def ensure_worker_engine_running():
-    global cluster_worker_pid, auto_pinger_instance, cluster_dispatcher_instance, token_renewal_daemon_instance, relogin_daemon_instance, continuous_claim_daemon_instance
+    global cluster_worker_pid, auto_pinger_instance, cluster_dispatcher_instance, token_renewal_daemon_instance, relogin_daemon_instance, continuous_claim_daemon_instance, session_launcher_daemon_instance
     current_pid = os.getpid()
 
     if PAUSE_MODE:
@@ -2008,6 +2040,8 @@ def ensure_worker_engine_running():
         relogin_daemon_instance.start()
         continuous_claim_daemon_instance = ContinuousClaimDaemon()
         continuous_claim_daemon_instance.start()
+        session_launcher_daemon_instance = SessionLauncherDaemon()
+        session_launcher_daemon_instance.start()
         token_renewal_daemon_instance = TokenRenewalDaemon()
         token_renewal_daemon_instance.start()
         auto_pinger_instance = AutoPinger()
@@ -2053,6 +2087,69 @@ def route_dashboard():
         round_subtext=GLOBAL_ROUND_INFO.get('timeline_subtext', 'Token Claim payouts unlock after Round 1 settlement'),
         round_min_pts=GLOBAL_ROUND_INFO.get('min_pts', 3000)
     )
+
+
+@app.route('/api/test_single_node')
+def route_test_single_node():
+    """Live diagnostic endpoint to test all features on a single node on demand."""
+    node_name = request.args.get('node', '')
+    node_idx = request.args.get('index', '')
+    target = None
+    if node_idx:
+        try:
+            target = NODES[int(node_idx)]
+        except Exception:
+            pass
+    if not target and node_name:
+        for n in NODES:
+            if n.name.lower() == node_name.lower() or n.email.lower() == node_name.lower():
+                target = n
+                break
+    if not target:
+        for n in NODES:
+            if n.access_token and '@alphea.local' not in n.email and '401' not in n.status:
+                target = n
+                break
+    if not target:
+        return jsonify({'success': False, 'message': 'No suitable test node found'}), 404
+
+    results = {'node': target.name, 'email': target.email, 'steps': {}}
+    
+    # 1. Start Session
+    sess_res = target.start_foreground_session(force=True)
+    results['steps']['1_start_session'] = {
+        'success': bool(sess_res),
+        'session_id': (target.session_id[:8] + '...') if target.session_id else None
+    }
+    
+    # 2. Submit Heartbeat
+    hb_res = target.submit_heartbeat() if target.session_id else False
+    results['steps']['2_submit_heartbeat'] = {
+        'success': bool(hb_res),
+        'uptime_seconds': target.session_uptime,
+        'uptime_formatted': f"{target.session_uptime // 60}m {target.session_uptime % 60}s"
+    }
+    
+    # 3. Sync Quests
+    target.sync_daily_quest_state()
+    results['steps']['3_sync_quests'] = {
+        'today_seconds': target.today_seconds,
+        'today_formatted': f"{target.today_seconds // 3600}h {(target.today_seconds % 3600) // 60}m",
+        'daily_claimed': target.daily_claimed
+    }
+    
+    # 4. Check Round & Point Balance
+    target.check_round_redeem_status()
+    results['steps']['4_round_and_balance'] = {
+        'points_balance': target.balance,
+        'redeem_status': target.redeem_status_text,
+        'pinned_wallet': target.pinned_wallet
+    }
+    
+    results['overall_status'] = 'PASS' if (sess_res and hb_res) else 'PARTIAL'
+    res = jsonify(results)
+    res.headers.add('Access-Control-Allow-Origin', '*')
+    return res, 200
 
 @app.route('/health')
 def route_health():
@@ -2203,7 +2300,7 @@ def route_update_account():
 def route_revive_cluster():
     def revive_runner():
         # STRICT SAFETY: ONLY revive nodes that are NOT advancing mining time (stalled 0 uptime) or inactive! Active nodes advancing uptime remain 100% untouched!
-        nodes_to_revive = [n for n in NODES if (n.status != 'Mining Active' or not n.jwt_exp or time.time() >= n.jwt_exp) and n.access_token and '@alphea.local' not in n.email]
+        nodes_to_revive = [n for n in NODES if (not n.session_id or n.session_uptime == 0 or not n.jwt_exp or time.time() >= n.jwt_exp) and n.access_token and '@alphea.local' not in n.email]
         add_log(f"[REVIVE] Targeted revival started for {len(nodes_to_revive)} stalled/timed-out nodes (Active advancing nodes completely untouched)...")
         success = 0
         for node in nodes_to_revive:
