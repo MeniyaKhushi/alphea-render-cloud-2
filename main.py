@@ -150,8 +150,8 @@ def decode_jwt_exp(token):
 def fetch_accounts_from_github():
     if not GITHUB_TOKEN:
         return None
-    try:
-        for branch_name in ['cluster-state', 'main']:
+    for branch_name in ['cluster-state', 'main']:
+        try:
             url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE_PATH}?ref={branch_name}"
             headers = {
                 'Authorization': f"token {GITHUB_TOKEN}",
@@ -160,14 +160,21 @@ def fetch_accounts_from_github():
             r = requests.get(url, headers=headers, timeout=12)
             if r.status_code == 200:
                 data = r.json()
-                content = base64.b64decode(data['content']).decode('utf-8')
+                raw_b64 = data.get('content', '')
+                if not raw_b64:
+                    continue
+                content = base64.b64decode(raw_b64).decode('utf-8')
+                if not content or not content.strip():
+                    continue
                 accounts = json.loads(content)
-                add_log(f"Loaded {len(accounts)} accounts from GitHub repo branch '{branch_name}'")
-                with open(ACCOUNTS_FILE, 'w') as f:
-                    f.write(content)
-                return accounts
-    except Exception as e:
-        add_log(f"GitHub fetch note: {e}")
+                if isinstance(accounts, list) and len(accounts) >= 10:
+                    add_log(f"Loaded {len(accounts)} accounts from GitHub repo branch '{branch_name}'")
+                    with open(ACCOUNTS_FILE, 'w') as f:
+                        f.write(content)
+                    return accounts
+        except Exception as e:
+            add_log(f"GitHub fetch note for '{branch_name}': {e}")
+            continue
     return None
 
 LAST_GITHUB_SYNC = 0
