@@ -289,6 +289,7 @@ class AccountWorker:
         self.can_redeem = False
         self.redeem_status_text = "0 Pts (Standby)"
         self.redeem_claimed = False
+        self.accepted_points = 0
         self.worker_thread = None
         self.is_running = False
 
@@ -357,7 +358,8 @@ class AccountWorker:
             'pinned_wallet': self.pinned_wallet,
             'can_redeem': self.can_redeem,
             'redeem_status_text': self.redeem_status_text,
-            'redeem_claimed': self.redeem_claimed
+            'redeem_claimed': self.redeem_claimed,
+            'accepted_points': getattr(self, 'accepted_points', 0)
         }
 
     def save_updated_tokens(self):
@@ -778,15 +780,15 @@ class AccountWorker:
 
     def check_round_redeem_status(self):
         # 1. Query official wallet point balance (Primary source of truth for total balance)
-        official_pts = 0
+        official_pts = None
         try:
             r_pts = self.authenticated_rpc('alphea.connect.v1.WalletService/GetPointBalance', {})
             if r_pts and r_pts.status_code == 200:
                 pts_data = r_pts.json()
+                # Micros to points (1 pt = 1,000,000 micros) - allows 0 when points are fully redeemed into round
                 bal_pts = int(pts_data.get('balance', {}).get('micros', '0')) // 1000000
-                if bal_pts > 0:
-                    official_pts = bal_pts
-                    self.balance = bal_pts
+                official_pts = bal_pts
+                self.balance = bal_pts
         except Exception:
             pass
 
@@ -796,12 +798,16 @@ class AccountWorker:
             balance_micros = int(data.get('balance', {}).get('micros', '0'))
             bal = balance_micros // 1000000
 
-            # Keep official balance if available, otherwise fallback to round balance
-            if official_pts > 0:
+            # If official_pts was successfully fetched (even if 0), keep it; otherwise fallback to round balance
+            if official_pts is not None:
                 self.balance = official_pts
-            elif bal > 0:
+            else:
                 self.balance = bal
             self.cached_balance = self.balance
+
+            accepted_micros = int(data.get('acceptedTotal', {}).get('micros', '0'))
+            accepted_points = accepted_micros // 1000000
+            self.accepted_points = accepted_points
 
             self.round_id = data.get('roundId', '')
             self.round_status = data.get('status', '')
@@ -1834,6 +1840,7 @@ HTML_TEMPLATE = """
     <div class="stat-card">
       <span class="stat-card-title">💎 Total Cluster Points</span>
       <span class="stat-card-val" style="color:#00d2ff;">{{ "{:,}".format(total_points) }} Pts</span>
+      <span style="font-size:11px; color:#94a3b8; display:block; margin-top:2px;">Avail: {{ "{:,}".format(available_points) }} | Locked in Round: {{ "{:,}".format(redeemed_points) }}</span>
     </div>
     <div class="stat-card">
       <span class="stat-card-title">⚡ Mining Active Nodes</span>
@@ -1869,7 +1876,9 @@ HTML_TEMPLATE = """
       </div>
       <div class="stats-row">
         <span class="stat-label">Points Balance:</span>
-        <span class="stat-val" style="color:#00d2ff;">{{ "{:,}".format(n.balance) }} Pts</span>
+        <span class="stat-val" style="color:{% if n.balance == 0 and n.redeem_claimed %}#10b981{% else %}#00d2ff{% endif %}; font-weight:700;">
+          {{ "{:,}".format(n.balance) }} Pts {% if n.balance == 0 and n.redeem_claimed %}<span style="font-size:10px; color:#10b981;">(Deposited)</span>{% endif %}
+        </span>
       </div>
       <div class="stats-row">
         <span class="stat-label">Round Redeem:</span>
@@ -2075,7 +2084,9 @@ def route_dashboard():
         for node in NODES:
             node.update_cluster_state()
     active_cnt = sum(1 for n in CLUSTER_STATE.values() if n.get('status') == 'Mining Active' or 'Standby' in n.get('status', '') or ('Active' in n.get('status', '') and not ('Dead' in n.get('status', '') or '401' in n.get('status', ''))))
-    total_pts = sum(n.get('balance', 0) for n in CLUSTER_STATE.values())
+    avail_pts = sum(n.get('balance', 0) for n in CLUSTER_STATE.values())
+    locked_pts = sum(n.get('accepted_points', 0) for n in CLUSTER_STATE.values())
+    total_pts = avail_pts + locked_pts
     redeemed_cnt = sum(1 for n in CLUSTER_STATE.values() if 'Claimed' in n.get('redeem_status_text', ''))
     daily_claimed_cnt = sum(1 for n in CLUSTER_STATE.values() if n.get('daily_claimed') is True)
     can_redeem_any = any(n.get('can_redeem') is True and n.get('balance', 0) > 0 for n in CLUSTER_STATE.values())
@@ -2088,6 +2099,8 @@ def route_dashboard():
         total_nodes=len(NODES),
         active_nodes=active_cnt,
         total_points=total_pts,
+        available_points=avail_pts,
+        redeemed_points=locked_pts,
         redeemed_count=redeemed_cnt,
         daily_claimed_count=daily_claimed_cnt,
         last_daily_checkin=LAST_DAILY_CHECKIN_TIME,
@@ -2189,9 +2202,19 @@ def route_api_status():
     with NODES_LOCK:
         for node in NODES:
             node.update_cluster_state()
+    avail_pts = sum(n.get('balance', 0) for n in CLUSTER_STATE.values())
+    locked_pts = sum(n.get('accepted_points', 0) for n in CLUSTER_STATE.values())
+    total_pts = avail_pts + locked_pts
+    active_cnt = sum(1 for n in CLUSTER_STATE.values() if n.get('status') == 'Mining Active' or 'Standby' in n.get('status', '') or ('Active' in n.get('status', '') and not ('Dead' in n.get('status', '') or '401' in n.get('status', ''))))
+    redeemed_cnt = sum(1 for n in CLUSTER_STATE.values() if 'Claimed' in n.get('redeem_status_text', ''))
     return jsonify({
         'cluster': CLUSTER_STATE,
         'total_nodes': len(NODES),
+        'active_nodes': active_cnt,
+        'total_points': total_pts,
+        'available_points': avail_pts,
+        'redeemed_points': locked_pts,
+        'redeemed_count': redeemed_cnt,
         'logs': CLUSTER_LOGS[-50:]
     }), 200
 
@@ -2444,40 +2467,57 @@ def route_redeem_all():
         IS_REDEEM_RUNNING = True
     LAST_REDEEM_ALL_TIME = get_ist_now_str()
     save_timestamps()
+    def redeem_worker_task(node):
+        if not node.access_token or '@alphea.local' in node.email or '401' in node.status or 'Dead' in node.status or 'Expired' in node.status:
+            return 'skipped'
+        # 0ms Fast-Path for nodes already claimed in this round (Untouched & Safe)
+        if node.redeem_claimed or 'Claimed' in node.redeem_status_text:
+            return 'already'
+        try:
+            res = node.request_redeem()
+            msg = res.get('message', '')
+            add_log(f"[{node.name}] Request Redeem: {msg}")
+            if res.get('success'):
+                return 'already' if res.get('already_redeemed') else 'success'
+            elif res.get('below_minimum'):
+                return 'below_min'
+            else:
+                return 'ineligible'
+        except Exception as e:
+            add_log(f"[{node.name}] Request Redeem error: {e}")
+            return 'error'
+
     def redeem_runner():
         global IS_REDEEM_RUNNING
         try:
-            add_log(f"[REDEEM ALL] Global 1-Click Request Redeem started at {LAST_REDEEM_ALL_TIME}...")
+            add_log(f"[REDEEM ALL] Global High-Speed 1-Click Request Redeem started at {LAST_REDEEM_ALL_TIME}...")
+            eligible_nodes = [
+                n for n in list(NODES)
+                if n.access_token and '@alphea.local' not in n.email and '401' not in n.status and 'Dead' not in n.status and 'Expired' not in n.status
+            ]
             success_count = 0
             already_count = 0
             below_min_count = 0
             ineligible_count = 0
-            skipped_cnt = 0
-            nodes_copy = list(NODES)
-            for node in nodes_copy:
-                if not node.access_token or '@alphea.local' in node.email or '401' in node.status or 'Dead' in node.status or 'Expired' in node.status:
-                    skipped_cnt += 1
-                    continue
-                # 0ms Instant Fast-Path for nodes already claimed in this round (Untouched & Safe)
-                if node.redeem_claimed or 'Claimed' in node.redeem_status_text:
-                    already_count += 1
-                    continue
-                try:
-                    res = node.request_redeem()
-                    msg = res.get('message', '')
-                    if res.get('success'):
-                        if res.get('already_redeemed'):
-                            already_count += 1
-                        else:
+            skipped_cnt = len(NODES) - len(eligible_nodes)
+
+            # High-Speed 6 concurrent workers with micro-staggers: blitzes 150+ nodes in ~15-20s
+            with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+                futures = {executor.submit(redeem_worker_task, node): node for node in eligible_nodes}
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        res_type = future.result()
+                        if res_type == 'success':
                             success_count += 1
-                    elif res.get('below_minimum'):
-                        below_min_count += 1
-                    else:
+                        elif res_type == 'already':
+                            already_count += 1
+                        elif res_type == 'below_min':
+                            below_min_count += 1
+                        else:
+                            ineligible_count += 1
+                    except Exception:
                         ineligible_count += 1
-                    add_log(f"[{node.name}] Request Redeem: {msg}")
-                except Exception as e:
-                    add_log(f"[{node.name}] Request Redeem error: {e}")
-                time.sleep(random.uniform(1.8, 2.5))
+
             add_log(f"[REDEEM ALL] Sequence completed at {get_ist_now_str()}! Redeemed: {success_count} | Already Redeemed (Untouched): {already_count} | Below Min (<3k): {below_min_count} | Standby/No Wallet: {ineligible_count} | Skipped: {skipped_cnt}")
         finally:
             with SWEEP_LOCK:
