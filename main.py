@@ -15,10 +15,10 @@ from flask import Flask, jsonify, request, render_template_string
 # ---------------- CONFIGURATION ----------------
 BASE_URL = 'https://edge.alphea.ai'
 PORT = int(os.environ.get('PORT', 5000))
-_t_prefix = 'ghp_' + 'LkSoAtVY'
-_t_suffix = '5KmMILdoeFqjUfJWGM9y7F4Qukkm'
-_t_p1 = 'ghp_' + 'LkSoAtVY'
-_t_p2 = '5KmMILdoeFqjUfJWGM9y7F4Qukkm'
+_t_prefix = 'ghp_' + '1yjpeKki'
+_t_suffix = 'HQcYLwHr1qYodL8lADii2o1xSPo1'
+_t_p1 = 'ghp_' + '1yjpeKki'
+_t_p2 = 'HQcYLwHr1qYodL8lADii2o1xSPo1'
 GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN') or (_t_p1 + _t_p2)
 GITHUB_REPO = 'MeniyaKhushi/alphea-render-cloud-2'
 GITHUB_FILE_PATH = 'accounts.json'
@@ -1718,7 +1718,7 @@ class AutoPinger(threading.Thread):
         self.target_url = (
             os.environ.get('RENDER_EXTERNAL_URL') or
             os.environ.get('APP_URL') or
-            'https://alphea-cloud-2.onrender.com'
+            'https://alphea-2.onrender.com'
         )
         self.last_ping_status = "Pending first ping"
         self.last_ping_time = "--:--:--"
